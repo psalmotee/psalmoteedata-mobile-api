@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PsalmoteeData Mobile API
  * Description: Secure mobile authentication endpoints for the PsalmoteeData app.
- * Version: 0.2.0
+ * Version: 0.3.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Author: Psalmotee-Tech
@@ -15,7 +15,7 @@ if (!defined('ABSPATH')) {
 
 final class PsalmoteeData_Mobile_API {
 
-    const VERSION = '0.2.0';
+    const VERSION = '0.3.0';
     const REST_NAMESPACE = 'psalmoteedata-mobile/v1';
 
     // Maximum lifetime of an authentication token.
@@ -31,6 +31,7 @@ final class PsalmoteeData_Mobile_API {
     private static $instance = null;
 
     public static function instance() {
+
         if (self::$instance === null) {
             self::$instance = new self();
         }
@@ -38,14 +39,46 @@ final class PsalmoteeData_Mobile_API {
         return self::$instance;
     }
 
+    /**
+     * Prevent direct instantiation.
+     */
     private function __construct() {
-        add_action('rest_api_init', array($this, 'register_routes'));
+
+        add_action(
+            'rest_api_init',
+            array($this, 'register_routes')
+        );
+
+        // Revoke sessions when a password is changed.
+        add_action(
+            'wp_set_password',
+            array($this, 'handle_password_changed'),
+            10,
+            3
+        );
+
+        // Handle password reset flows.
+        add_action(
+            'after_password_reset',
+            array($this, 'handle_password_reset'),
+            10,
+            2
+        );
+
+        // Detect password changes through profile updates.
+        add_action(
+            'profile_update',
+            array($this, 'handle_profile_update'),
+            10,
+            2
+        );
     }
 
     /**
      * Create the authentication token database table.
      */
     public static function activate() {
+
         global $wpdb;
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
@@ -124,9 +157,182 @@ final class PsalmoteeData_Mobile_API {
      * Get authentication token table.
      */
     private function token_table() {
+
         global $wpdb;
 
         return $wpdb->prefix . 'psalmoteedata_mobile_tokens';
+    }
+
+    /**
+     * Revoke all mobile sessions belonging to a user.
+     */
+    private function revoke_user_sessions($user_id) {
+
+        global $wpdb;
+
+        $user_id = absint($user_id);
+
+        if (!$user_id) {
+            return false;
+        }
+
+        $deleted = $wpdb->delete(
+            $this->token_table(),
+            array(
+                'user_id' => $user_id,
+            ),
+            array('%d')
+        );
+
+        return $deleted !== false;
+    }
+
+    /**
+     * Create a new mobile session and invalidate previous sessions.
+     *
+     * A database lock prevents concurrent logins for the same user
+     * from creating multiple active sessions.
+     */
+    private function create_single_user_session(
+        $user_id,
+        $plain_token,
+        $created_at,
+        $expires_at
+    ) {
+
+        global $wpdb;
+
+        $user_id = absint($user_id);
+
+        if (!$user_id) {
+            return false;
+        }
+
+        $token_hash = hash('sha256', $plain_token);
+
+        // Generate a consistent lock name for this user.
+        $lock_name = 'ptd_mobile_' . substr(
+            hash('sha256', (string) $user_id),
+            0,
+            32
+        );
+
+        // Acquire a database lock for this user's login.
+        $lock_acquired = $wpdb->get_var(
+            $wpdb->prepare(
+                'SELECT GET_LOCK(%s, 10)',
+                $lock_name
+            )
+        );
+
+        if ((string) $lock_acquired !== '1') {
+            return false;
+        }
+
+        try {
+
+            // Insert the new session first.
+            $inserted = $wpdb->insert(
+                $this->token_table(),
+                array(
+                    'token_hash' => $token_hash,
+                    'user_id' => $user_id,
+                    'created_at' => $created_at,
+                    'expires_at' => $expires_at,
+                    'last_used_at' => $created_at,
+                ),
+                array('%s', '%d', '%s', '%s', '%s')
+            );
+
+            if (!$inserted) {
+                return false;
+            }
+
+            // Remove every other mobile session belonging to this user.
+            $deleted = $wpdb->query(
+                $wpdb->prepare(
+                    "DELETE FROM {$this->token_table()}
+                     WHERE user_id = %d
+                     AND token_hash <> %s",
+                    $user_id,
+                    $token_hash
+                )
+            );
+
+            // If previous sessions cannot be removed, revoke the new token.
+            if ($deleted === false) {
+
+                $wpdb->delete(
+                    $this->token_table(),
+                    array(
+                        'token_hash' => $token_hash,
+                    ),
+                    array('%s')
+                );
+
+                return false;
+            }
+
+            return true;
+
+        } finally {
+
+            // Always release the database lock.
+            $wpdb->get_var(
+                $wpdb->prepare(
+                    'SELECT RELEASE_LOCK(%s)',
+                    $lock_name
+                )
+            );
+        }
+    }
+
+    /**
+     * Handle WordPress password changes.
+     */
+    public function handle_password_changed(
+        $password,
+        $user_id,
+        $old_user_data = null
+    ) {
+
+        $this->revoke_user_sessions($user_id);
+    }
+
+    /**
+     * Handle WordPress password resets.
+     */
+    public function handle_password_reset($user, $new_password) {
+
+        if ($user instanceof WP_User) {
+
+            $this->revoke_user_sessions($user->ID);
+        }
+    }
+
+    /**
+     * Detect password changes made through profile updates.
+     */
+    public function handle_profile_update($user_id, $old_user_data) {
+
+        if (
+            !($old_user_data instanceof WP_User) ||
+            empty($old_user_data->user_pass)
+        ) {
+            return;
+        }
+
+        $current_user = get_userdata($user_id);
+
+        if (!$current_user) {
+            return;
+        }
+
+        // Compare old and new password hashes.
+        if ($old_user_data->user_pass !== $current_user->user_pass) {
+
+            $this->revoke_user_sessions($user_id);
+        }
     }
 
     /**
@@ -185,6 +391,11 @@ final class PsalmoteeData_Mobile_API {
 
     /**
      * Validate VTU Press account.
+     *
+     * Checks:
+     * 1. VTU Press account synchronization.
+     * 2. Account suspension status.
+     * 3. Email verification when enabled.
      */
     private function validate_vtupress_account($wp_user) {
 
@@ -207,7 +418,7 @@ final class PsalmoteeData_Mobile_API {
             true
         );
 
-        if (!$vt_user) {
+        if (!$vt_user || !is_array($vt_user)) {
 
             return new WP_Error(
                 'account_not_synced',
@@ -216,6 +427,27 @@ final class PsalmoteeData_Mobile_API {
             );
         }
 
+        // Ensure the account status is available.
+        if (!array_key_exists('access_status', $vt_user)) {
+
+            return new WP_Error(
+                'account_status_unavailable',
+                'Unable to verify your account status. Please try again later.',
+                array('status' => 503)
+            );
+        }
+
+        // Reject suspended accounts.
+        if ($vt_user['access_status'] === 'blocked') {
+
+            return new WP_Error(
+                'account_suspended',
+                'Your account has been suspended. Please contact support.',
+                array('status' => 403)
+            );
+        }
+
+        // Load VTU Press settings.
         $settings_table = $wpdb->prefix . 'vtupress_general_settings';
 
         $settings = $wpdb->get_row(
@@ -232,6 +464,7 @@ final class PsalmoteeData_Mobile_API {
             );
         }
 
+        // Check email verification if enabled.
         if (
             isset($settings['enable_email_verification']) &&
             $settings['enable_email_verification'] === 'yes' &&
@@ -278,6 +511,7 @@ final class PsalmoteeData_Mobile_API {
             ), 429);
         }
 
+        // Find WordPress user.
         if (is_email($identifier)) {
 
             $wp_user = get_user_by(
@@ -301,8 +535,25 @@ final class PsalmoteeData_Mobile_API {
             ), 401);
         }
 
-        // Validate VTU Press account.
-        $account_check = $this->validate_vtupress_account($wp_user);
+        // Verify password.
+        $authenticated_user = wp_authenticate(
+            $wp_user->user_login,
+            $password
+        );
+
+        // Reject invalid credentials.
+        if (is_wp_error($authenticated_user)) {
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Invalid login details.',
+            ), 401);
+        }
+
+        // Validate VTU Press account after password verification.
+        $account_check = $this->validate_vtupress_account(
+            $authenticated_user
+        );
 
         if (is_wp_error($account_check)) {
 
@@ -317,20 +568,6 @@ final class PsalmoteeData_Mobile_API {
                 'message' => $account_check->get_error_message(),
                 'code' => $account_check->get_error_code(),
             ), $status);
-        }
-
-        // Verify password.
-        $authenticated_user = wp_authenticate(
-            $wp_user->user_login,
-            $password
-        );
-
-        if (is_wp_error($authenticated_user)) {
-
-            return $this->response(array(
-                'success' => false,
-                'message' => 'Invalid login details.',
-            ), 401);
         }
 
         // Generate secure random token.
@@ -358,18 +595,12 @@ final class PsalmoteeData_Mobile_API {
             $now + self::TOKEN_LIFETIME
         );
 
-        global $wpdb;
-
-        $inserted = $wpdb->insert(
-            $this->token_table(),
-            array(
-                'token_hash' => hash('sha256', $plain_token),
-                'user_id' => (int) $authenticated_user->ID,
-                'created_at' => $created_at,
-                'expires_at' => $expires_at,
-                'last_used_at' => $created_at,
-            ),
-            array('%s', '%d', '%s', '%s', '%s')
+        // Create a new session and invalidate previous sessions.
+        $inserted = $this->create_single_user_session(
+            $authenticated_user->ID,
+            $plain_token,
+            $created_at,
+            $expires_at
         );
 
         if (!$inserted) {
@@ -380,6 +611,7 @@ final class PsalmoteeData_Mobile_API {
             ), 500);
         }
 
+        // Clear login rate limit after successful login.
         $this->clear_login_rate_limit($identifier);
 
         return $this->response(array(
@@ -421,7 +653,14 @@ final class PsalmoteeData_Mobile_API {
     /**
      * Authenticate requests using Bearer tokens.
      *
-     * Also enforces inactivity timeout and refreshes last_used_at.
+     * Enforces:
+     * - Token validity.
+     * - Token expiration.
+     * - Inactivity timeout.
+     * - WordPress user existence.
+     * - VTU Press account status.
+     *
+     * Refreshes last_used_at after successful authentication.
      */
     public function authenticate_request(WP_REST_Request $request) {
 
@@ -496,7 +735,9 @@ final class PsalmoteeData_Mobile_API {
 
             $wpdb->delete(
                 $table,
-                array('token_hash' => $token_hash),
+                array(
+                    'token_hash' => $token_hash,
+                ),
                 array('%s')
             );
 
@@ -517,7 +758,9 @@ final class PsalmoteeData_Mobile_API {
 
             $wpdb->delete(
                 $table,
-                array('token_hash' => $token_hash),
+                array(
+                    'token_hash' => $token_hash,
+                ),
                 array('%s')
             );
 
@@ -526,6 +769,22 @@ final class PsalmoteeData_Mobile_API {
                 'The account associated with this session no longer exists.',
                 array('status' => 401)
             );
+        }
+
+        // Revalidate VTU Press account on every authenticated request.
+        $account_check = $this->validate_vtupress_account($user);
+
+        if (is_wp_error($account_check)) {
+
+            // Immediately revoke all sessions if account is suspended.
+            if (
+                $account_check->get_error_code() === 'account_suspended'
+            ) {
+
+                $this->revoke_user_sessions($user->ID);
+            }
+
+            return $account_check;
         }
 
         // Set authenticated WordPress user.
