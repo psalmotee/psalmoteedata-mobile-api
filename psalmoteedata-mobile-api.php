@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PsalmoteeData Mobile API
  * Description: Secure mobile authentication endpoints for the PsalmoteeData app.
- * Version: 0.3.0
+ * Version: 0.5.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Author: Psalmotee-Tech
@@ -15,7 +15,7 @@ if (!defined('ABSPATH')) {
 
 final class PsalmoteeData_Mobile_API {
 
-    const VERSION = '0.3.0';
+    const VERSION = '0.5.0';
     const REST_NAMESPACE = 'psalmoteedata-mobile/v1';
 
     // Maximum lifetime of an authentication token.
@@ -27,6 +27,14 @@ final class PsalmoteeData_Mobile_API {
     // Login protection.
     const LOGIN_LIMIT = 10;
     const LOGIN_WINDOW = 15 * MINUTE_IN_SECONDS;
+
+    // Account activation protection.
+    const ACTIVATION_LIMIT = 5;
+    const ACTIVATION_WINDOW = 15 * MINUTE_IN_SECONDS;
+
+    // Registration protection.
+    const REGISTRATION_LIMIT = 5;
+    const REGISTRATION_WINDOW = 15 * MINUTE_IN_SECONDS;
 
     private static $instance = null;
 
@@ -114,6 +122,20 @@ final class PsalmoteeData_Mobile_API {
             'permission_callback' => '__return_true',
         ));
 
+        // Account activation.
+        register_rest_route(self::REST_NAMESPACE, '/activate', array(
+            'methods' => WP_REST_Server::CREATABLE,
+            'callback' => array($this, 'activate_account'),
+            'permission_callback' => '__return_true',
+        ));
+
+        // Account registration.
+        register_rest_route(self::REST_NAMESPACE, '/register', array(
+            'methods' => WP_REST_Server::CREATABLE,
+            'callback' => array($this, 'register_account'),
+            'permission_callback' => '__return_true',
+        ));
+
         // Current authenticated user.
         register_rest_route(self::REST_NAMESPACE, '/me', array(
             'methods' => WP_REST_Server::READABLE,
@@ -151,6 +173,49 @@ final class PsalmoteeData_Mobile_API {
         $response->header('Pragma', 'no-cache');
 
         return $response;
+    }
+
+        /**
+     * Generate registration rate-limit key.
+     */
+    private function registration_rate_key()
+    {
+        return 'ptd_mobile_register_' . hash(
+            'sha256',
+            $this->client_ip()
+        );
+    }
+
+    /**
+     * Check registration rate limit.
+     */
+    private function registration_rate_limited()
+    {
+        $key = $this->registration_rate_key();
+
+        $attempts = (int) get_transient($key);
+
+        if ($attempts >= self::REGISTRATION_LIMIT) {
+            return true;
+        }
+
+        set_transient(
+            $key,
+            $attempts + 1,
+            self::REGISTRATION_WINDOW
+        );
+
+        return false;
+    }
+
+    /**
+     * Clear registration rate limit.
+     */
+    private function clear_registration_rate_limit()
+    {
+        delete_transient(
+            $this->registration_rate_key()
+        );
     }
 
     /**
@@ -390,6 +455,49 @@ final class PsalmoteeData_Mobile_API {
     }
 
     /**
+     * Generate account activation rate-limit key.
+     */
+    private function activation_rate_key($username)
+    {
+        return 'ptd_mobile_activate_' . hash(
+            'sha256',
+            $this->client_ip() . '|' . strtolower($username)
+        );
+    }
+
+    /**
+     * Check account activation rate limit.
+     */
+    private function activation_rate_limited($username)
+    {
+        $key = $this->activation_rate_key($username);
+
+        $attempts = (int) get_transient($key);
+
+        if ($attempts >= self::ACTIVATION_LIMIT) {
+            return true;
+        }
+
+        set_transient(
+            $key,
+            $attempts + 1,
+            self::ACTIVATION_WINDOW
+        );
+
+        return false;
+    }
+
+    /**
+     * Clear activation rate limit after successful activation.
+     */
+    private function clear_activation_rate_limit($username)
+    {
+        delete_transient(
+            $this->activation_rate_key($username)
+        );
+    }
+
+    /**
      * Validate VTU Press account.
      *
      * Checks:
@@ -482,6 +590,777 @@ final class PsalmoteeData_Mobile_API {
         }
 
         return true;
+    }
+
+    /**
+     * Activate a VTU Press account.
+     *
+     * Validates the activation code and marks the user's
+     * VTU Press email address as verified.
+     */
+    public function activate_account(WP_REST_Request $request)
+    {
+        $username = trim(
+            sanitize_user((string) $request->get_param('username'))
+        );
+
+        $activation_code = trim(
+            sanitize_text_field((string) $request->get_param('activation_code'))
+        );
+
+        if ($username === '' || $activation_code === '') {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Username and activation code are required.',
+            ), 400);
+        }
+
+        if (!preg_match('/^[0-9]{4,10}$/', $activation_code)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Please enter a valid activation code.',
+            ), 400);
+        }
+
+        // Protect against repeated activation attempts.
+        if ($this->activation_rate_limited($username)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Too many activation attempts. Please wait and try again.',
+            ), 429);
+        }
+
+        // Find the WordPress account.
+        $wp_user = get_user_by('login', $username);
+
+        if (!$wp_user) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Invalid username or activation code.',
+            ), 400);
+        }
+
+        // Ensure VTU Press services are available.
+        if (!class_exists('Users')) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Account services are temporarily unavailable.',
+            ), 503);
+        }
+
+        $users_api = new Users();
+
+        // Retrieve the VTU Press account using the WordPress user ID.
+        $vt_user = $users_api->getUser(
+            $wp_user->ID,
+            true,
+            true
+        );
+
+        if (!$vt_user || !is_array($vt_user) || empty($vt_user['id'])) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'VTU Press account could not be found.',
+            ), 404);
+        }
+
+        // Check whether the account has already been activated.
+        if (
+            $vt_user['email_verified'] === 'yes' ||
+            $vt_user['email_verified'] === 'verified'
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Your account has already been activated.',
+                'code' => 'already_activated',
+            ), 409);
+        }
+
+        // Support the existing VTU Press activation-code format.
+        $stored_code = (string) ($vt_user['reset_code'] ?? '');
+
+        $legacy_code = (
+            $vt_user['email_verified'] !== 'false' &&
+            $vt_user['email_verified'] !== 'verified'
+        ) ? (string) $vt_user['email_verified'] : '';
+
+        $code_matches = (
+            ($stored_code !== '' && hash_equals($stored_code, $activation_code)) ||
+            ($legacy_code !== '' && hash_equals($legacy_code, $activation_code))
+        );
+
+        if (!$code_matches) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Invalid username or activation code.',
+            ), 400);
+        }
+
+        /*
+        * IMPORTANT:
+        * Users::update() expects the VTU Press record ID,
+        * not the WordPress user ID.
+        */
+        $updated = $users_api->update(
+            (int) $vt_user['id'],
+            array(
+                'email_verified' => 'yes',
+                'reset_code' => '',
+            )
+        );
+
+        if (!$updated) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to activate your account. Please try again.',
+            ), 500);
+        }
+
+        // Clear the activation rate limit.
+        $this->clear_activation_rate_limit($username);
+
+        return $this->response(array(
+            'success' => true,
+            'message' => 'Your account has been activated successfully.',
+            'user' => array(
+                'username' => $wp_user->user_login,
+            ),
+        ));
+    }
+
+    /**
+     * Register a new VTU Press account through the mobile API.
+     */
+    public function register_account(WP_REST_Request $request)
+    {
+        global $wpdb;
+
+        // Apply registration rate limiting.
+        if ($this->registration_rate_limited()) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Too many registration attempts. Please wait and try again.',
+            ), 429);
+        }
+
+        // Collect and sanitize registration information.
+        $username = trim(
+            sanitize_user((string) $request->get_param('username'))
+        );
+
+        $email = trim(
+            sanitize_email((string) $request->get_param('email'))
+        );
+
+        $password = (string) $request->get_param('password');
+
+        $password_confirmation = (string) $request->get_param(
+            'password_confirmation'
+        );
+
+        $phone = trim(
+            sanitize_text_field((string) $request->get_param('phone'))
+        );
+
+        $first_name = trim(
+            sanitize_text_field((string) $request->get_param('first_name'))
+        );
+
+        $last_name = trim(
+            sanitize_text_field((string) $request->get_param('last_name'))
+        );
+
+        $pin = trim(
+            sanitize_text_field((string) $request->get_param('pin'))
+        );
+
+        $country = trim(
+            sanitize_text_field((string) $request->get_param('country'))
+        );
+
+        $referral = trim(
+            (string) ($request->get_param('referral') ?: '1')
+        );
+
+        $bvn_nin_type = trim(
+            sanitize_text_field((string) $request->get_param('bvn_nin_type'))
+        );
+
+        $bvn_nin_value = trim(
+            sanitize_text_field((string) $request->get_param('bvn_nin_value'))
+        );
+
+        // Required fields.
+        if (
+            $username === '' ||
+            $email === '' ||
+            $password === '' ||
+            $password_confirmation === '' ||
+            $phone === '' ||
+            $first_name === '' ||
+            $last_name === '' ||
+            $pin === '' ||
+            $country === ''
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Please complete all required registration fields.',
+            ), 400);
+        }
+
+        // Validate username.
+        if (
+            !validate_username($username) ||
+            strlen($username) > 60
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Please provide a valid username.',
+            ), 400);
+        }
+
+        // Validate email.
+        if (!is_email($email)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Please provide a valid email address.',
+            ), 400);
+        }
+
+        // Validate password.
+        if (strlen($password) < 8) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Your password must contain at least 8 characters.',
+            ), 400);
+        }
+
+        if ($password !== $password_confirmation) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Your passwords do not match.',
+            ), 400);
+        }
+
+        // Validate names.
+        if (
+            strlen($first_name) < 3 ||
+            strlen($last_name) < 3
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'First and last names must contain at least 3 characters.',
+            ), 400);
+        }
+
+        // Validate transaction PIN.
+        if (!preg_match('/^[1-9][0-9]{3}$/', $pin)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Your transaction PIN must contain exactly 4 digits and cannot start with zero.',
+            ), 400);
+        }
+
+        // Validate referral ID.
+        if (!preg_match('/^[0-9]+$/', $referral)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Please provide a valid referral ID.',
+            ), 400);
+        }
+
+        // Ensure VTU Press country services are available.
+        if (
+            !class_exists('Vtupress_Country_Manager') ||
+            !method_exists('Vtupress_Country_Manager', 'enabled')
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Country registration services are unavailable.',
+            ), 503);
+        }
+
+        // Check whether the selected country is enabled.
+        $enabled_countries = Vtupress_Country_Manager::enabled();
+
+        if (
+            !is_array($enabled_countries) ||
+            !in_array($country, $enabled_countries, true)
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'This country is not enabled for registration.',
+            ), 400);
+        }
+
+        // Load VTU Press general settings.
+        $settings_table = $wpdb->prefix . 'vtupress_general_settings';
+
+        $settings = $wpdb->get_row(
+            "SELECT * FROM {$settings_table} ORDER BY id ASC LIMIT 1",
+            ARRAY_A
+        );
+
+        if (empty($settings)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Account settings are currently unavailable.',
+            ), 503);
+        }
+
+        // Check whether registration is enabled.
+        $registration_enabled = $settings['enable_registration'] ?? 'yes';
+
+        if (
+            $registration_enabled !== 'yes' &&
+            $registration_enabled !== 'true'
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Registration is temporarily unavailable.',
+            ), 403);
+        }
+
+        // Normalize phone number using the existing VTU Press helper.
+        if (!function_exists('vtupress_normalize_phone')) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Phone number services are currently unavailable.',
+            ), 503);
+        }
+
+        $normalized_phone = vtupress_normalize_phone($phone);
+
+        $phone = $normalized_phone['local'] ?? '';
+
+        if (!preg_match('/^[0-9]{10,15}$/', $phone)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Please provide a valid phone number.',
+            ), 400);
+        }
+
+        // Check existing WordPress accounts.
+        if (username_exists($username)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'This username is already taken.',
+            ), 409);
+        }
+
+        if (email_exists($email)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'An account with this email already exists.',
+            ), 409);
+        }
+
+        // VTU Press users table.
+        $vtu_users_table = $wpdb->prefix . 'vtupress_users';
+
+        // Check whether phone number already exists.
+        $existing_phone = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT id FROM {$vtu_users_table} WHERE phone = %s LIMIT 1",
+                $phone
+            )
+        );
+
+        if ($existing_phone) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'This phone number is already registered.',
+            ), 409);
+        }
+
+        // Check BVN/NIN requirements configured in the manual gateway.
+        $manual_gateway = class_exists('Vtupress_Gateway_Container')
+            ? Vtupress_Gateway_Container::get('manual')
+            : null;
+
+        $manual_settings = $manual_gateway
+            ? $manual_gateway->get_settings()
+            : array();
+
+        $request_bvn_nin = (
+            $manual_settings['request_bvn_nin'] ?? 'no'
+        ) === 'yes';
+
+        $request_bvn_nin_required = (
+            $manual_settings['request_bvn_nin_required'] ?? 'no'
+        ) === 'yes';
+
+        $bvn = '';
+        $nin = '';
+
+        if ($request_bvn_nin && $bvn_nin_value !== '') {
+
+            if ($bvn_nin_type === 'bvn') {
+                $bvn = $bvn_nin_value;
+
+            } elseif ($bvn_nin_type === 'nin') {
+                $nin = $bvn_nin_value;
+
+            } else {
+                return $this->response(array(
+                    'success' => false,
+                    'message' => 'Please select whether you are providing a BVN or NIN.',
+                ), 400);
+            }
+        }
+
+        if (
+            $request_bvn_nin &&
+            $request_bvn_nin_required &&
+            $bvn === '' &&
+            $nin === ''
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Please provide your BVN or NIN to complete registration.',
+            ), 400);
+        }
+
+        // Resolve referral account.
+        $referrer_id = 1;
+
+        if ((int) $referral !== 1) {
+
+            $referrer_exists = $wpdb->get_var(
+                $wpdb->prepare(
+                    "SELECT id FROM {$vtu_users_table} WHERE id = %d LIMIT 1",
+                    (int) $referral
+                )
+            );
+
+            if ($referrer_exists) {
+                $referrer_id = (int) $referrer_exists;
+            }
+        }
+
+        // Create WordPress account.
+        $userdata = array(
+            'user_login' => $username,
+            'user_email' => $email,
+            'user_pass' => $password,
+            'first_name' => $first_name,
+            'last_name' => $last_name,
+        );
+
+        $wp_user_id = wp_insert_user($userdata);
+
+        if (is_wp_error($wp_user_id)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => $wp_user_id->get_error_message(),
+            ), 400);
+        }
+
+        // Generate VTU Press API key.
+        $api_key = 'vtu-' . wp_generate_password(32, false, false);
+
+        // Create VTU Press account record.
+        $new_user_data = array(
+            'userId' => $wp_user_id,
+            'first_name' => $first_name,
+            'last_name' => $last_name,
+            'email_verified' => 'false',
+            'plan' => 'customer',
+            'apikey' => $api_key,
+            'phone' => $phone,
+            'pin' => $pin,
+            'balance' => 0,
+            'referral_rewards' => 0,
+            'referrer_id' => $referrer_id,
+            'referrers' => '[]',
+            'indirect_referrers' => '[]',
+            'other_referrers' => '[]',
+            'about' => 'New User',
+            'beneficiaries' => '',
+            'fix_version' => '1.0',
+            'all_plans' => 'customer',
+            'run_code' => random_int(1000, 9999),
+            'set_country' => $country,
+            'bvn' => $bvn,
+            'nin' => $nin,
+        );
+
+        $inserted = $wpdb->insert(
+            $vtu_users_table,
+            $new_user_data
+        );
+
+        if (!$inserted) {
+
+            // Remove the WordPress account if VTU profile creation fails.
+            require_once ABSPATH . 'wp-admin/includes/user.php';
+
+            wp_delete_user($wp_user_id);
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to create your VTU Press account. Please try again.',
+            ), 500);
+        }
+
+        $vtu_user_id = (int) $wpdb->insert_id;
+
+        // Prepare email verification.
+        $email_verification_enabled = (
+            ($settings['enable_email_verification'] ?? 'no') === 'yes'
+        );
+
+        $email_sent = false;
+
+        if ($email_verification_enabled) {
+
+            try {
+                $activation_code = (string) random_int(10000, 99999);
+            } catch (Exception $exception) {
+
+                $wpdb->delete(
+                    $vtu_users_table,
+                    array('id' => $vtu_user_id),
+                    array('%d')
+                );
+
+                require_once ABSPATH . 'wp-admin/includes/user.php';
+
+                wp_delete_user($wp_user_id);
+
+                return $this->response(array(
+                    'success' => false,
+                    'message' => 'Unable to prepare account verification. Please try again.',
+                ), 500);
+            }
+
+            // Store activation code using the VTU Press record ID.
+            $users_api = new Users();
+
+            $code_saved = $users_api->update(
+                $vtu_user_id,
+                array(
+                    'reset_code' => $activation_code,
+                )
+            );
+
+            if (!$code_saved) {
+
+                $wpdb->delete(
+                    $vtu_users_table,
+                    array('id' => $vtu_user_id),
+                    array('%d')
+                );
+
+                require_once ABSPATH . 'wp-admin/includes/user.php';
+
+                wp_delete_user($wp_user_id);
+
+                return $this->response(array(
+                    'success' => false,
+                    'message' => 'Unable to prepare email verification. Please try again.',
+                ), 500);
+            }
+
+            // Use the existing VTU Press email system.
+            if (
+                class_exists('Vtupress_Mail')
+            ) {
+                $mailer = new Vtupress_Mail();
+
+                $email_sent = (bool) $mailer->sendMail(
+                    $email,
+                    'Account Verification',
+                    'Your account activation code is <strong>' .
+                        esc_html($activation_code) .
+                        '</strong>.'
+                );
+            }
+        }
+
+        // Update the referral tree.
+        if ($referrer_id !== 1) {
+
+            $upline_1 = $wpdb->get_row(
+                $wpdb->prepare(
+                    "SELECT id, referrers, referrer_id
+                    FROM {$vtu_users_table}
+                    WHERE id = %d",
+                    $referrer_id
+                )
+            );
+
+            if ($upline_1) {
+
+                $level_1_refs = json_decode(
+                    $upline_1->referrers,
+                    true
+                ) ?: array();
+
+                $level_1_refs[] = $vtu_user_id;
+
+                $wpdb->update(
+                    $vtu_users_table,
+                    array(
+                        'referrers' => wp_json_encode($level_1_refs),
+                    ),
+                    array(
+                        'id' => $upline_1->id,
+                    )
+                );
+
+                // Level 2.
+                $upline_2_id = (int) $upline_1->referrer_id;
+
+                if ($upline_2_id && $upline_2_id !== 1) {
+
+                    $upline_2 = $wpdb->get_row(
+                        $wpdb->prepare(
+                            "SELECT id, indirect_referrers, referrer_id
+                            FROM {$vtu_users_table}
+                            WHERE id = %d",
+                            $upline_2_id
+                        )
+                    );
+
+                    if ($upline_2) {
+
+                        $level_2_refs = json_decode(
+                            $upline_2->indirect_referrers,
+                            true
+                        ) ?: array();
+
+                        $level_2_refs[] = $vtu_user_id;
+
+                        $wpdb->update(
+                            $vtu_users_table,
+                            array(
+                                'indirect_referrers' => wp_json_encode($level_2_refs),
+                            ),
+                            array(
+                                'id' => $upline_2->id,
+                            )
+                        );
+
+                        // Level 3.
+                        $upline_3_id = (int) $upline_2->referrer_id;
+
+                        if ($upline_3_id && $upline_3_id !== 1) {
+
+                            $upline_3 = $wpdb->get_row(
+                                $wpdb->prepare(
+                                    "SELECT id, other_referrers
+                                    FROM {$vtu_users_table}
+                                    WHERE id = %d",
+                                    $upline_3_id
+                                )
+                            );
+
+                            if ($upline_3) {
+
+                                $level_3_refs = json_decode(
+                                    $upline_3->other_referrers,
+                                    true
+                                ) ?: array();
+
+                                $level_3_refs[] = $vtu_user_id;
+
+                                $wpdb->update(
+                                    $vtu_users_table,
+                                    array(
+                                        'other_referrers' => wp_json_encode($level_3_refs),
+                                    ),
+                                    array(
+                                        'id' => $upline_3->id,
+                                    )
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Create virtual account where the selected gateway supports it.
+        if (class_exists('Vtupress_Gateway_Container')) {
+
+            $gateways = Vtupress_Gateway_Container::for_country($country);
+
+            if (is_iterable($gateways)) {
+
+                foreach ($gateways as $gateway) {
+
+                    if (
+                        property_exists($gateway, 'create_on_reg') &&
+                        $gateway->create_on_reg === true
+                    ) {
+                        $gateway_settings = $gateway->get_settings();
+
+                        $account_on_registration = (
+                            $gateway_settings['account_on_registration'] ?? 'no'
+                        );
+
+                        if (
+                            $account_on_registration === 'yes' &&
+                            method_exists($gateway, 'create_virtual_account')
+                        ) {
+                            try {
+                                $gateway->create_virtual_account($wp_user_id);
+                            } catch (Throwable $exception) {
+                                // Virtual account creation must not invalidate registration.
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // wp_insert_user() already fires the WordPress user_register action.
+        // Do not fire it manually a second time.
+
+        // Clear registration rate limit after successful account creation.
+        $this->clear_registration_rate_limit();
+
+        // Return registration result.
+        if ($email_verification_enabled) {
+
+            if ($email_sent) {
+
+                return $this->response(array(
+                    'success' => true,
+                    'message' => 'Your account has been created. Please check your email for your activation code.',
+                    'verification_required' => true,
+                    'email_sent' => true,
+                    'user' => array(
+                        'username' => $username,
+                        'email' => $email,
+                    ),
+                ), 201);
+            }
+
+            // Account exists, but the email system did not confirm sending.
+            return $this->response(array(
+                'success' => true,
+                'message' => 'Your account was created, but we could not send the activation email. Please contact support for assistance.',
+                'verification_required' => true,
+                'email_sent' => false,
+                'user' => array(
+                    'username' => $username,
+                    'email' => $email,
+                ),
+            ), 201);
+        }
+
+        return $this->response(array(
+            'success' => true,
+            'message' => 'Your account has been created successfully. You can now sign in.',
+            'verification_required' => false,
+            'email_sent' => false,
+            'user' => array(
+                'username' => $username,
+                'email' => $email,
+            ),
+        ), 201);
     }
 
     /**
