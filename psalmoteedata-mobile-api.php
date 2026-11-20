@@ -169,6 +169,13 @@ final class PsalmoteeData_Mobile_API {
             'permission_callback' => array($this, 'authenticate_request'),
         ));
 
+        // Current authenticated user's wallet balance.
+        register_rest_route(self::REST_NAMESPACE, '/wallet', array(
+            'methods' => WP_REST_Server::READABLE,
+            'callback' => array($this, 'get_wallet_balance'),
+            'permission_callback' => array($this, 'authenticate_request'),
+        ));
+
         // Heartbeat.
         register_rest_route(self::REST_NAMESPACE, '/heartbeat', array(
             'methods' => WP_REST_Server::CREATABLE,
@@ -1089,6 +1096,69 @@ final class PsalmoteeData_Mobile_API {
         return $this->response(array(
             'success' => true,
             'user' => $this->public_user_data($user),
+        ));
+    }
+
+    /**
+     * Get the authenticated user's VTU Press wallet balance.
+     *
+     * The WordPress user ID is used to retrieve the linked
+     * VTU Press account. The VTU Press internal ID is then
+     * used to retrieve the wallet balance.
+     */
+    public function get_wallet_balance(WP_REST_Request $request)
+    {
+        $wp_user_id = get_current_user_id();
+
+        if (!$wp_user_id) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Authenticated user could not be identified.',
+            ), 401);
+        }
+
+        // Confirm that the VTU Press Users class is available.
+        if (
+            !class_exists('Users') ||
+            !method_exists('Users', 'getUser') ||
+            !method_exists('Users', 'getBalance')
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Wallet service is currently unavailable.',
+            ), 503);
+        }
+
+        $users_api = new Users();
+
+        // Retrieve the VTU Press account using the WordPress user ID.
+        $vt_user = $users_api->getUser(
+            $wp_user_id,
+            true,
+            true
+        );
+
+        if (
+            !$vt_user ||
+            !is_array($vt_user) ||
+            empty($vt_user['id'])
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Your wallet account could not be found.',
+            ), 404);
+        }
+
+        // Use the VTU Press internal user ID to retrieve the balance.
+        $balance = $users_api->getBalance(
+            (int) $vt_user['id']
+        );
+
+        return $this->response(array(
+            'success' => true,
+            'wallet' => array(
+                'balance' => round((float) $balance, 2),
+            ),
         ));
     }
 
