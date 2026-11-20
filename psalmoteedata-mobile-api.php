@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PsalmoteeData Mobile API
  * Description: Secure mobile authentication endpoints for the PsalmoteeData app.
- * Version: 0.5.0
+ * Version: 0.7.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Author: Psalmotee-Tech
@@ -15,7 +15,7 @@ if (!defined('ABSPATH')) {
 
 final class PsalmoteeData_Mobile_API {
 
-    const VERSION = '0.5.0';
+    const VERSION = '0.7.0';
     const REST_NAMESPACE = 'psalmoteedata-mobile/v1';
 
     // Maximum lifetime of an authentication token.
@@ -31,6 +31,10 @@ final class PsalmoteeData_Mobile_API {
     // Account activation protection.
     const ACTIVATION_LIMIT = 5;
     const ACTIVATION_WINDOW = 15 * MINUTE_IN_SECONDS;
+
+    // Resend activation email protection.
+    const RESEND_ACTIVATION_LIMIT = 5;
+    const RESEND_ACTIVATION_WINDOW = 15 * MINUTE_IN_SECONDS;
 
     // Registration protection.
     const REGISTRATION_LIMIT = 5;
@@ -115,12 +119,27 @@ final class PsalmoteeData_Mobile_API {
      */
     public function register_routes() {
 
-        // Login.
-        register_rest_route(self::REST_NAMESPACE, '/login', array(
+         // Account registration.
+        register_rest_route(self::REST_NAMESPACE, '/register', array(
             'methods' => WP_REST_Server::CREATABLE,
-            'callback' => array($this, 'login'),
+            'callback' => array($this, 'register_account'),
             'permission_callback' => '__return_true',
         ));
+
+        // Enabled registration countries.
+        register_rest_route(self::REST_NAMESPACE, '/countries', array(
+            'methods' => WP_REST_Server::READABLE,
+            'callback' => array($this, 'get_countries'),
+            'permission_callback' => '__return_true',
+        ));
+
+        // Registration configuration.
+        register_rest_route(self::REST_NAMESPACE, '/registration-config', array(
+            'methods' => WP_REST_Server::READABLE,
+            'callback' => array($this, 'get_registration_config'),
+            'permission_callback' => '__return_true',
+        ));
+
 
         // Account activation.
         register_rest_route(self::REST_NAMESPACE, '/activate', array(
@@ -129,10 +148,17 @@ final class PsalmoteeData_Mobile_API {
             'permission_callback' => '__return_true',
         ));
 
-        // Account registration.
-        register_rest_route(self::REST_NAMESPACE, '/register', array(
+        // Resend account activation email.
+        register_rest_route(self::REST_NAMESPACE, '/resend-activation', array(
             'methods' => WP_REST_Server::CREATABLE,
-            'callback' => array($this, 'register_account'),
+            'callback' => array($this, 'resend_activation_email'),
+            'permission_callback' => '__return_true',
+        ));
+
+        // Login.
+        register_rest_route(self::REST_NAMESPACE, '/login', array(
+            'methods' => WP_REST_Server::CREATABLE,
+            'callback' => array($this, 'login'),
             'permission_callback' => '__return_true',
         ));
 
@@ -159,6 +185,79 @@ final class PsalmoteeData_Mobile_API {
     }
 
     /**
+     * Get countries enabled for account registration.
+     */
+    public function get_countries(WP_REST_Request $request)
+    {
+        // Confirm that the VTU Press country manager is available.
+        if (
+            !class_exists('Vtupress_Country_Manager') ||
+            !method_exists('Vtupress_Country_Manager', 'enabled')
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Country registration services are unavailable.',
+            ), 503);
+        }
+
+        // Retrieve the same enabled countries used by the website.
+        $enabled_countries = Vtupress_Country_Manager::enabled();
+
+        if (!is_array($enabled_countries)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to retrieve available countries.',
+            ), 503);
+        }
+
+        $countries = array();
+
+        foreach ($enabled_countries as $key) {
+            $key = (string) $key;
+
+            $countries[] = array(
+                'value' => strtolower($key),
+                'label' => ucfirst($key),
+            );
+        }
+
+        return $this->response(array(
+            'success' => true,
+            'countries' => $countries,
+        ));
+    }
+
+    /**
+     * Get public registration configuration.
+     */
+    public function get_registration_config(WP_REST_Request $request)
+    {
+        $manual_gateway = class_exists('Vtupress_Gateway_Container')
+            ? Vtupress_Gateway_Container::get('manual')
+            : null;
+
+        $manual_settings = $manual_gateway
+            ? $manual_gateway->get_settings()
+            : array();
+
+        $request_bvn_nin = (
+            $manual_settings['request_bvn_nin'] ?? 'no'
+        ) === 'yes';
+
+        $request_bvn_nin_required = (
+            $manual_settings['request_bvn_nin_required'] ?? 'no'
+        ) === 'yes';
+
+        return $this->response(array(
+            'success' => true,
+            'registration' => array(
+                'request_bvn_nin' => $request_bvn_nin,
+                'request_bvn_nin_required' => $request_bvn_nin_required,
+            ),
+        ));
+    }
+
+    /**
      * Standard API response.
      */
     private function response($data, $status = 200) {
@@ -175,7 +274,7 @@ final class PsalmoteeData_Mobile_API {
         return $response;
     }
 
-        /**
+    /**
      * Generate registration rate-limit key.
      */
     private function registration_rate_key()
@@ -203,6 +302,15 @@ final class PsalmoteeData_Mobile_API {
             $key,
             $attempts + 1,
             self::REGISTRATION_WINDOW
+        );
+
+        error_log(
+            'Registration rate limit: ' .
+            wp_json_encode(array(
+                'attempts_before' => $attempts,
+                'attempts_after' => $attempts + 1,
+                'ip' => $this->client_ip(),
+            ))
         );
 
         return false;
@@ -457,21 +565,20 @@ final class PsalmoteeData_Mobile_API {
     /**
      * Generate account activation rate-limit key.
      */
-    private function activation_rate_key($username)
+    private function activation_rate_key($rate_identity)
     {
         return 'ptd_mobile_activate_' . hash(
             'sha256',
-            $this->client_ip() . '|' . strtolower($username)
+            $this->client_ip() . '|' . strtolower($rate_identity)
         );
     }
 
     /**
      * Check account activation rate limit.
      */
-    private function activation_rate_limited($username)
+    private function activation_rate_limited($rate_identity)
     {
-        $key = $this->activation_rate_key($username);
-
+        $key = $this->activation_rate_key($rate_identity);
         $attempts = (int) get_transient($key);
 
         if ($attempts >= self::ACTIVATION_LIMIT) {
@@ -490,64 +597,250 @@ final class PsalmoteeData_Mobile_API {
     /**
      * Clear activation rate limit after successful activation.
      */
-    private function clear_activation_rate_limit($username)
+    private function clear_activation_rate_limit($rate_identity)
     {
         delete_transient(
-            $this->activation_rate_key($username)
+            $this->activation_rate_key($rate_identity)
         );
     }
 
     /**
-     * Validate VTU Press account.
+     * Generate resend activation rate-limit key.
+     */
+    private function resend_activation_rate_key($rate_identity)
+    {
+        return 'ptd_mobile_resend_activation_' . hash(
+            'sha256',
+            $this->client_ip() . '|' . strtolower($rate_identity)
+        );
+    }
+
+    /**
+     * Check resend activation rate limit.
+     */
+    private function resend_activation_rate_limited($rate_identity)
+    {
+        $key = $this->resend_activation_rate_key($rate_identity);
+
+        $attempts = (int) get_transient($key);
+
+        if ($attempts >= self::RESEND_ACTIVATION_LIMIT) {
+            return true;
+        }
+
+        set_transient(
+            $key,
+            $attempts + 1,
+            self::RESEND_ACTIVATION_WINDOW
+        );
+
+        return false;
+    }
+
+    /**
+     * Login endpoint.
+     */
+    public function login(WP_REST_Request $request) {
+
+        $identifier = trim(
+            (string) $request->get_param('username')
+        );
+
+        $password = (string) $request->get_param('password');
+
+        if ($identifier === '' || $password === '') {
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Username/email and password are required.',
+            ), 400);
+        }
+
+        if ($this->login_rate_limited($identifier)) {
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Too many login attempts. Please wait and try again.',
+            ), 429);
+        }
+
+        // Find WordPress user.
+        if (is_email($identifier)) {
+
+            $wp_user = get_user_by(
+                'email',
+                sanitize_email($identifier)
+            );
+
+        } else {
+
+            $wp_user = get_user_by(
+                'login',
+                sanitize_user($identifier)
+            );
+        }
+
+        if (!$wp_user) {
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Invalid login details.',
+            ), 401);
+        }
+
+        // Verify password.
+        $authenticated_user = wp_authenticate(
+            $wp_user->user_login,
+            $password
+        );
+
+        // Reject invalid credentials.
+        if (is_wp_error($authenticated_user)) {
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Invalid login details.',
+            ), 401);
+        }
+
+        // Validate VTU Press account after password verification.
+        $account_check = $this->validate_vtupress_account(
+            $authenticated_user
+        );
+
+        if (is_wp_error($account_check)) {
+
+            $data = $account_check->get_error_data();
+
+            $status = is_array($data) && isset($data['status'])
+                ? (int) $data['status']
+                : 403;
+
+            return $this->response(array(
+                'success' => false,
+                'message' => $account_check->get_error_message(),
+                'code' => $account_check->get_error_code(),
+            ), $status);
+        }
+
+        // Generate secure random token.
+        try {
+
+            $plain_token = bin2hex(random_bytes(32));
+
+        } catch (Exception $exception) {
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to create a secure session. Please try again.',
+            ), 500);
+        }
+
+        $now = time();
+
+        $created_at = gmdate(
+            'Y-m-d H:i:s',
+            $now
+        );
+
+        $expires_at = gmdate(
+            'Y-m-d H:i:s',
+            $now + self::TOKEN_LIFETIME
+        );
+
+        // Create a new session and invalidate previous sessions.
+        $inserted = $this->create_single_user_session(
+            $authenticated_user->ID,
+            $plain_token,
+            $created_at,
+            $expires_at
+        );
+
+        if (!$inserted) {
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to create your session. Please try again.',
+            ), 500);
+        }
+
+        // Clear login rate limit after successful login.
+        $this->clear_login_rate_limit($identifier);
+
+        return $this->response(array(
+            'success' => true,
+            'message' => 'Login successful.',
+            'token_type' => 'Bearer',
+            'access_token' => $plain_token,
+            'expires_at' => gmdate(
+                'c',
+                $now + self::TOKEN_LIFETIME
+            ),
+            'user' => $this->public_user_data($authenticated_user),
+        ));
+    }
+
+    /**
+     * Validate a WordPress user's VTU Press account.
      *
      * Checks:
-     * 1. VTU Press account synchronization.
-     * 2. Account suspension status.
-     * 3. Email verification when enabled.
+     * - WordPress user validity.
+     * - VTU Press account existence.
+     * - Account suspension status.
+     * - Email verification requirements.
      */
-    private function validate_vtupress_account($wp_user) {
-
-        global $wpdb;
-
-        if (!class_exists('Users')) {
-
+    private function validate_vtupress_account($user)
+    {
+        if (
+            !($user instanceof WP_User) ||
+            !$user->exists()
+        ) {
             return new WP_Error(
-                'vtupress_unavailable',
-                'VTU Press account services are not available.',
+                'invalid_user',
+                'The account could not be verified.',
+                array('status' => 403)
+            );
+        }
+
+        // Ensure VTU Press account services are available.
+        if (
+            !class_exists('Users') ||
+            !method_exists('Users', 'getUser')
+        ) {
+            return new WP_Error(
+                'account_service_unavailable',
+                'Account services are temporarily unavailable.',
                 array('status' => 503)
             );
         }
 
         $users_api = new Users();
 
+        // Retrieve the VTU Press account using the WordPress user ID.
         $vt_user = $users_api->getUser(
-            $wp_user->ID,
+            $user->ID,
             true,
             true
         );
 
-        if (!$vt_user || !is_array($vt_user)) {
-
+        if (
+            !$vt_user ||
+            !is_array($vt_user) ||
+            empty($vt_user['id'])
+        ) {
             return new WP_Error(
-                'account_not_synced',
-                'This account is not synchronized with VTU Press. Please contact support.',
+                'vtu_account_not_found',
+                'Your VTU Press account could not be found.',
                 array('status' => 403)
             );
         }
 
-        // Ensure the account status is available.
-        if (!array_key_exists('access_status', $vt_user)) {
+        // Check whether the account has been blocked.
+        $access_status = strtolower(
+            trim((string) ($vt_user['access_status'] ?? ''))
+        );
 
-            return new WP_Error(
-                'account_status_unavailable',
-                'Unable to verify your account status. Please try again later.',
-                array('status' => 503)
-            );
-        }
-
-        // Reject suspended accounts.
-        if ($vt_user['access_status'] === 'blocked') {
-
+        if ($access_status === 'blocked') {
             return new WP_Error(
                 'account_suspended',
                 'Your account has been suspended. Please contact support.',
@@ -555,7 +848,9 @@ final class PsalmoteeData_Mobile_API {
             );
         }
 
-        // Load VTU Press settings.
+        // Retrieve VTU Press email verification settings.
+        global $wpdb;
+
         $settings_table = $wpdb->prefix . 'vtupress_general_settings';
 
         $settings = $wpdb->get_row(
@@ -564,81 +859,326 @@ final class PsalmoteeData_Mobile_API {
         );
 
         if (empty($settings)) {
-
             return new WP_Error(
                 'account_settings_unavailable',
-                'Account settings could not be loaded.',
+                'Unable to verify your account settings. Please try again.',
                 array('status' => 503)
             );
         }
 
-        // Check email verification if enabled.
-        if (
-            isset($settings['enable_email_verification']) &&
-            $settings['enable_email_verification'] === 'yes' &&
-            (
-                !isset($vt_user['email_verified']) ||
-                $vt_user['email_verified'] !== 'yes'
-            )
-        ) {
+        // Require activation only when email verification is enabled.
+        $email_verification_enabled = (
+            ($settings['enable_email_verification'] ?? 'no') === 'yes'
+        );
 
-            return new WP_Error(
-                'email_not_verified',
-                'Please verify your email address before signing in.',
-                array('status' => 403)
+        if ($email_verification_enabled) {
+
+            $email_verified = strtolower(
+                trim((string) ($vt_user['email_verified'] ?? ''))
             );
+
+            if (!in_array($email_verified, array('yes', 'verified'), true)) {
+                return new WP_Error(
+                    'account_not_activated',
+                    'Please activate your account before signing in.',
+                    array('status' => 403)
+                );
+            }
         }
 
         return true;
     }
 
     /**
+     * Public user information.
+     */
+    private function public_user_data($user) {
+
+        return array(
+            'id' => (int) $user->ID,
+            'username' => (string) $user->user_login,
+            'display_name' => (string) $user->display_name,
+            'email' => (string) $user->user_email,
+            'first_name' => (string) get_user_meta(
+                $user->ID,
+                'first_name',
+                true
+            ),
+            'last_name' => (string) get_user_meta(
+                $user->ID,
+                'last_name',
+                true
+            ),
+        );
+    }
+
+    /**
+     * Authenticate requests using Bearer tokens.
+     *
+     * Enforces:
+     * - Token validity.
+     * - Token expiration.
+     * - Inactivity timeout.
+     * - WordPress user existence.
+     * - VTU Press account status.
+     *
+     * Refreshes last_used_at after successful authentication.
+     */
+    public function authenticate_request(WP_REST_Request $request) {
+
+        $authorization = $request->get_header('authorization');
+
+        if (
+            !$authorization &&
+            isset($_SERVER['HTTP_AUTHORIZATION'])
+        ) {
+
+            $authorization = sanitize_text_field(
+                wp_unslash($_SERVER['HTTP_AUTHORIZATION'])
+            );
+        }
+
+        if (
+            !$authorization ||
+            !preg_match(
+                '/^Bearer\s+([a-f0-9]{64})$/i',
+                trim($authorization),
+                $matches
+            )
+        ) {
+
+            return new WP_Error(
+                'missing_or_invalid_token',
+                'A valid Bearer token is required.',
+                array('status' => 401)
+            );
+        }
+
+        $token_hash = hash('sha256', $matches[1]);
+
+        global $wpdb;
+
+        $table = $this->token_table();
+
+        $now = time();
+
+        // Retrieve token information.
+        $token_row = $wpdb->get_row(
+            $wpdb->prepare(
+                "SELECT user_id, last_used_at
+                 FROM {$table}
+                 WHERE token_hash = %s
+                 AND expires_at > %s
+                 LIMIT 1",
+                $token_hash,
+                gmdate('Y-m-d H:i:s', $now)
+            )
+        );
+
+        if (!$token_row) {
+
+            return new WP_Error(
+                'invalid_or_expired_token',
+                'Your session is invalid or has expired. Please sign in again.',
+                array('status' => 401)
+            );
+        }
+
+        // Calculate last activity.
+        $last_used = $token_row->last_used_at
+            ? strtotime($token_row->last_used_at . ' UTC')
+            : false;
+
+        // Revoke inactive token.
+        if (
+            !$last_used ||
+            ($now - $last_used) >= self::INACTIVITY_TIMEOUT
+        ) {
+
+            $wpdb->delete(
+                $table,
+                array(
+                    'token_hash' => $token_hash,
+                ),
+                array('%s')
+            );
+
+            return new WP_Error(
+                'session_inactive',
+                'Your session expired due to inactivity. Please sign in again.',
+                array('status' => 401)
+            );
+        }
+
+        // Retrieve WordPress user.
+        $user = get_user_by(
+            'id',
+            (int) $token_row->user_id
+        );
+
+        if (!$user) {
+
+            $wpdb->delete(
+                $table,
+                array(
+                    'token_hash' => $token_hash,
+                ),
+                array('%s')
+            );
+
+            return new WP_Error(
+                'user_not_found',
+                'The account associated with this session no longer exists.',
+                array('status' => 401)
+            );
+        }
+
+        // Revalidate VTU Press account on every authenticated request.
+        $account_check = $this->validate_vtupress_account($user);
+
+        if (is_wp_error($account_check)) {
+
+            // Immediately revoke all sessions if account is suspended.
+            if (
+                $account_check->get_error_code() === 'account_suspended'
+            ) {
+
+                $this->revoke_user_sessions($user->ID);
+            }
+
+            return $account_check;
+        }
+
+        // Set authenticated WordPress user.
+        wp_set_current_user($user->ID);
+
+        // Refresh last activity.
+        $wpdb->update(
+            $table,
+            array(
+                'last_used_at' => gmdate(
+                    'Y-m-d H:i:s',
+                    $now
+                ),
+            ),
+            array(
+                'token_hash' => $token_hash,
+            ),
+            array('%s'),
+            array('%s')
+        );
+
+        return true;
+    }
+
+    /**
+     * Current authenticated user endpoint.
+     */
+    public function get_me(WP_REST_Request $request) {
+
+        $user = wp_get_current_user();
+
+        if (!$user || !$user->exists()) {
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Authenticated user could not be loaded.',
+            ), 401);
+        }
+
+        return $this->response(array(
+            'success' => true,
+            'user' => $this->public_user_data($user),
+        ));
+    }
+
+    /**
+     * Heartbeat endpoint.
+     *
+     * The permission callback authenticates the token
+     * and updates its last_used_at timestamp.
+     */
+    public function heartbeat(WP_REST_Request $request) {
+
+        return $this->response(array(
+            'success' => true,
+            'message' => 'Session is active.',
+            'server_time' => gmdate('c'),
+        ));
+    }
+
+    /**
      * Activate a VTU Press account.
      *
-     * Validates the activation code and marks the user's
-     * VTU Press email address as verified.
+     * Accepts a username or email address and validates
+     * the activation code before marking the account as verified.
      */
     public function activate_account(WP_REST_Request $request)
     {
-        $username = trim(
-            sanitize_user((string) $request->get_param('username'))
+        $identifier = trim(
+            (string) $request->get_param('identifier')
         );
 
         $activation_code = trim(
             sanitize_text_field((string) $request->get_param('activation_code'))
         );
 
-        if ($username === '' || $activation_code === '') {
+        // Normalize the identifier.
+        if (is_email($identifier)) {
+            $identifier = strtolower(sanitize_email($identifier));
+        } else {
+            $identifier = sanitize_user($identifier);
+        }
+
+        if ($identifier === '' || $activation_code === '') {
             return $this->response(array(
                 'success' => false,
-                'message' => 'Username and activation code are required.',
+                'message' => 'Username/email and activation code are required.',
             ), 400);
         }
 
-        if (!preg_match('/^[0-9]{4,10}$/', $activation_code)) {
+        // Activation codes generated by this API contain exactly five digits.
+        if (!preg_match('/^[0-9]{5}$/', $activation_code)) {
             return $this->response(array(
                 'success' => false,
-                'message' => 'Please enter a valid activation code.',
+                'message' => 'Please enter a valid five-digit activation code.',
             ), 400);
         }
 
         // Protect against repeated activation attempts.
-        if ($this->activation_rate_limited($username)) {
+        
+        if ($this->activation_rate_limited($identifier)) {
             return $this->response(array(
                 'success' => false,
                 'message' => 'Too many activation attempts. Please wait and try again.',
             ), 429);
         }
 
-        // Find the WordPress account.
-        $wp_user = get_user_by('login', $username);
+       // Resolve the identifier as either an email or username.
+        $wp_user = is_email($identifier)
+            ? get_user_by('email', $identifier)
+            : get_user_by('login', $identifier);
+
+        // Use the same rate-limit identity for both username and email.
+        $rate_identity = $wp_user
+            ? 'user:' . (int) $wp_user->ID
+            : 'identifier:' . strtolower($identifier);
+
+        // Protect against repeated activation attempts.
+        if ($this->activation_rate_limited($rate_identity)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Too many activation attempts. Please wait and try again.',
+            ), 429);
+        }
 
         if (!$wp_user) {
             return $this->response(array(
                 'success' => false,
-                'message' => 'Invalid username or activation code.',
+                'message' => 'Invalid username/email or activation code.',
             ), 400);
         }
+                
 
         // Ensure VTU Press services are available.
         if (!class_exists('Users')) {
@@ -660,15 +1200,14 @@ final class PsalmoteeData_Mobile_API {
         if (!$vt_user || !is_array($vt_user) || empty($vt_user['id'])) {
             return $this->response(array(
                 'success' => false,
-                'message' => 'VTU Press account could not be found.',
-            ), 404);
+                'message' => 'Invalid username/email or activation code.',
+            ), 400);
         }
 
+        $email_verified = (string) ($vt_user['email_verified'] ?? '');
+
         // Check whether the account has already been activated.
-        if (
-            $vt_user['email_verified'] === 'yes' ||
-            $vt_user['email_verified'] === 'verified'
-        ) {
+        if (in_array($email_verified, array('yes', 'verified'), true)) {
             return $this->response(array(
                 'success' => false,
                 'message' => 'Your account has already been activated.',
@@ -676,13 +1215,13 @@ final class PsalmoteeData_Mobile_API {
             ), 409);
         }
 
-        // Support the existing VTU Press activation-code format.
+        // Support existing VTU Press activation-code formats.
         $stored_code = (string) ($vt_user['reset_code'] ?? '');
 
         $legacy_code = (
-            $vt_user['email_verified'] !== 'false' &&
-            $vt_user['email_verified'] !== 'verified'
-        ) ? (string) $vt_user['email_verified'] : '';
+            $email_verified !== 'false' &&
+            $email_verified !== 'verified'
+        ) ? $email_verified : '';
 
         $code_matches = (
             ($stored_code !== '' && hash_equals($stored_code, $activation_code)) ||
@@ -692,7 +1231,7 @@ final class PsalmoteeData_Mobile_API {
         if (!$code_matches) {
             return $this->response(array(
                 'success' => false,
-                'message' => 'Invalid username or activation code.',
+                'message' => 'Invalid username/email or activation code.',
             ), 400);
         }
 
@@ -716,8 +1255,8 @@ final class PsalmoteeData_Mobile_API {
             ), 500);
         }
 
-        // Clear the activation rate limit.
-        $this->clear_activation_rate_limit($username);
+        // Clear the activation rate limit after successful activation.
+        $this->clear_activation_rate_limit($rate_identity);
 
         return $this->response(array(
             'success' => true,
@@ -726,6 +1265,166 @@ final class PsalmoteeData_Mobile_API {
                 'username' => $wp_user->user_login,
             ),
         ));
+    }
+
+    /**
+     * Resend account activation email.
+     *
+     * Accepts a username or email address.
+     * Uses a generic response to prevent account enumeration.
+     */
+    public function resend_activation_email(WP_REST_Request $request)
+    {
+        $identifier = trim(
+            (string) $request->get_param('identifier')
+        );
+
+        if (is_email($identifier)) {
+            $identifier = strtolower(sanitize_email($identifier));
+        } else {
+            $identifier = sanitize_user($identifier);
+        }
+
+        if ($identifier === '') {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Username or email is required.',
+            ), 400);
+        }
+
+        $generic_response = array(
+            'success' => true,
+            'message' => 'If your account requires email verification, an activation code will be sent to your registered email address.',
+        );
+
+        // Resolve the identifier.
+        $wp_user = is_email($identifier)
+            ? get_user_by('email', $identifier)
+            : get_user_by('login', $identifier);
+
+        // Share the rate limit between username and email.
+        $rate_identity = $wp_user
+            ? 'user:' . (int) $wp_user->ID
+            : 'identifier:' . strtolower($identifier);
+
+        if ($this->resend_activation_rate_limited($rate_identity)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Too many requests. Please wait before requesting another activation email.',
+            ), 429);
+        }
+
+        if (!$wp_user) {
+            return $this->response($generic_response);
+        }
+
+        if (!class_exists('Users')) {
+            error_log('PsalmoteeData Mobile API: VTU Press Users class unavailable during activation resend.');
+            return $this->response($generic_response);
+        }
+
+        $users_api = new Users();
+
+        $vt_user = $users_api->getUser(
+            $wp_user->ID,
+            true,
+            true
+        );
+
+        if (
+            !$vt_user ||
+            !is_array($vt_user) ||
+            empty($vt_user['id'])
+        ) {
+            return $this->response($generic_response);
+        }
+
+        $email_verified = (string) ($vt_user['email_verified'] ?? '');
+
+        if (in_array($email_verified, array('yes', 'verified'), true)) {
+            return $this->response($generic_response);
+        }
+
+        global $wpdb;
+
+        $settings_table = $wpdb->prefix . 'vtupress_general_settings';
+
+        $settings = $wpdb->get_row(
+            "SELECT * FROM {$settings_table} ORDER BY id ASC LIMIT 1",
+            ARRAY_A
+        );
+
+        if (empty($settings)) {
+            error_log('PsalmoteeData Mobile API: Unable to load VTU Press settings during activation resend.');
+            return $this->response($generic_response);
+        }
+
+        if (
+            !isset($settings['enable_email_verification']) ||
+            $settings['enable_email_verification'] !== 'yes'
+        ) {
+            return $this->response($generic_response);
+        }
+
+        $email = sanitize_email($wp_user->user_email);
+
+        if (!is_email($email)) {
+            return $this->response($generic_response);
+        }
+
+        if (!class_exists('Vtupress_Mail')) {
+            error_log('PsalmoteeData Mobile API: VTU Press mail service unavailable during activation resend.');
+            return $this->response($generic_response);
+        }
+
+        try {
+            $code = (string) random_int(10000, 99999);
+        } catch (Throwable $e) {
+            error_log('PsalmoteeData Mobile API: Failed to generate activation code.');
+            return $this->response($generic_response);
+        }
+
+        $previous_code = (string) ($vt_user['reset_code'] ?? '');
+
+        // Update the VTU Press record using its own record ID.
+        $updated = $users_api->update(
+            (int) $vt_user['id'],
+            array(
+                'reset_code' => $code,
+            )
+        );
+
+        if (!$updated) {
+            error_log('PsalmoteeData Mobile API: Failed to save activation code.');
+            return $this->response($generic_response);
+        }
+
+        $mailer = new Vtupress_Mail();
+
+        $email_sent = $mailer->sendMail(
+            $email,
+            'Account Verification',
+            'Your activation code is <strong>' .
+                esc_html($code) .
+                '</strong>'
+        );
+
+        if (!$email_sent) {
+            // Restore the previous code if delivery fails.
+            $restored = $users_api->update(
+                (int) $vt_user['id'],
+                array(
+                    'reset_code' => $previous_code,
+                )
+            );
+
+            error_log(
+                'PsalmoteeData Mobile API: Activation email delivery failed. Code restoration: ' .
+                ($restored ? 'successful' : 'failed')
+            );
+        }
+
+        return $this->response($generic_response);
     }
 
     /**
@@ -921,6 +1620,22 @@ final class PsalmoteeData_Mobile_API {
             ), 403);
         }
 
+        // Check email verification configuration before creating accounts.
+        $email_verification_enabled = (
+            ($settings['enable_email_verification'] ?? 'no') === 'yes'
+        );
+
+        // Prevent incomplete account creation if VTU Press Users is unavailable.
+        if (
+            $email_verification_enabled &&
+            !class_exists('Users')
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Account verification services are temporarily unavailable.',
+            ), 503);
+        }
+
         // Normalize phone number using the existing VTU Press helper.
         if (!function_exists('vtupress_normalize_phone')) {
             return $this->response(array(
@@ -1075,7 +1790,6 @@ final class PsalmoteeData_Mobile_API {
             'referrers' => '[]',
             'indirect_referrers' => '[]',
             'other_referrers' => '[]',
-            'about' => 'New User',
             'beneficiaries' => '',
             'fix_version' => '1.0',
             'all_plans' => 'customer',
@@ -1104,11 +1818,6 @@ final class PsalmoteeData_Mobile_API {
         }
 
         $vtu_user_id = (int) $wpdb->insert_id;
-
-        // Prepare email verification.
-        $email_verification_enabled = (
-            ($settings['enable_email_verification'] ?? 'no') === 'yes'
-        );
 
         $email_sent = false;
 
@@ -1361,367 +2070,6 @@ final class PsalmoteeData_Mobile_API {
                 'email' => $email,
             ),
         ), 201);
-    }
-
-    /**
-     * Login endpoint.
-     */
-    public function login(WP_REST_Request $request) {
-
-        $identifier = trim(
-            (string) $request->get_param('username')
-        );
-
-        $password = (string) $request->get_param('password');
-
-        if ($identifier === '' || $password === '') {
-
-            return $this->response(array(
-                'success' => false,
-                'message' => 'Username/email and password are required.',
-            ), 400);
-        }
-
-        if ($this->login_rate_limited($identifier)) {
-
-            return $this->response(array(
-                'success' => false,
-                'message' => 'Too many login attempts. Please wait and try again.',
-            ), 429);
-        }
-
-        // Find WordPress user.
-        if (is_email($identifier)) {
-
-            $wp_user = get_user_by(
-                'email',
-                sanitize_email($identifier)
-            );
-
-        } else {
-
-            $wp_user = get_user_by(
-                'login',
-                sanitize_user($identifier)
-            );
-        }
-
-        if (!$wp_user) {
-
-            return $this->response(array(
-                'success' => false,
-                'message' => 'Invalid login details.',
-            ), 401);
-        }
-
-        // Verify password.
-        $authenticated_user = wp_authenticate(
-            $wp_user->user_login,
-            $password
-        );
-
-        // Reject invalid credentials.
-        if (is_wp_error($authenticated_user)) {
-
-            return $this->response(array(
-                'success' => false,
-                'message' => 'Invalid login details.',
-            ), 401);
-        }
-
-        // Validate VTU Press account after password verification.
-        $account_check = $this->validate_vtupress_account(
-            $authenticated_user
-        );
-
-        if (is_wp_error($account_check)) {
-
-            $data = $account_check->get_error_data();
-
-            $status = is_array($data) && isset($data['status'])
-                ? (int) $data['status']
-                : 403;
-
-            return $this->response(array(
-                'success' => false,
-                'message' => $account_check->get_error_message(),
-                'code' => $account_check->get_error_code(),
-            ), $status);
-        }
-
-        // Generate secure random token.
-        try {
-
-            $plain_token = bin2hex(random_bytes(32));
-
-        } catch (Exception $exception) {
-
-            return $this->response(array(
-                'success' => false,
-                'message' => 'Unable to create a secure session. Please try again.',
-            ), 500);
-        }
-
-        $now = time();
-
-        $created_at = gmdate(
-            'Y-m-d H:i:s',
-            $now
-        );
-
-        $expires_at = gmdate(
-            'Y-m-d H:i:s',
-            $now + self::TOKEN_LIFETIME
-        );
-
-        // Create a new session and invalidate previous sessions.
-        $inserted = $this->create_single_user_session(
-            $authenticated_user->ID,
-            $plain_token,
-            $created_at,
-            $expires_at
-        );
-
-        if (!$inserted) {
-
-            return $this->response(array(
-                'success' => false,
-                'message' => 'Unable to create your session. Please try again.',
-            ), 500);
-        }
-
-        // Clear login rate limit after successful login.
-        $this->clear_login_rate_limit($identifier);
-
-        return $this->response(array(
-            'success' => true,
-            'message' => 'Login successful.',
-            'token_type' => 'Bearer',
-            'access_token' => $plain_token,
-            'expires_at' => gmdate(
-                'c',
-                $now + self::TOKEN_LIFETIME
-            ),
-            'user' => $this->public_user_data($authenticated_user),
-        ));
-    }
-
-    /**
-     * Public user information.
-     */
-    private function public_user_data($user) {
-
-        return array(
-            'id' => (int) $user->ID,
-            'username' => (string) $user->user_login,
-            'display_name' => (string) $user->display_name,
-            'email' => (string) $user->user_email,
-            'first_name' => (string) get_user_meta(
-                $user->ID,
-                'first_name',
-                true
-            ),
-            'last_name' => (string) get_user_meta(
-                $user->ID,
-                'last_name',
-                true
-            ),
-        );
-    }
-
-    /**
-     * Authenticate requests using Bearer tokens.
-     *
-     * Enforces:
-     * - Token validity.
-     * - Token expiration.
-     * - Inactivity timeout.
-     * - WordPress user existence.
-     * - VTU Press account status.
-     *
-     * Refreshes last_used_at after successful authentication.
-     */
-    public function authenticate_request(WP_REST_Request $request) {
-
-        $authorization = $request->get_header('authorization');
-
-        if (
-            !$authorization &&
-            isset($_SERVER['HTTP_AUTHORIZATION'])
-        ) {
-
-            $authorization = sanitize_text_field(
-                wp_unslash($_SERVER['HTTP_AUTHORIZATION'])
-            );
-        }
-
-        if (
-            !$authorization ||
-            !preg_match(
-                '/^Bearer\s+([a-f0-9]{64})$/i',
-                trim($authorization),
-                $matches
-            )
-        ) {
-
-            return new WP_Error(
-                'missing_or_invalid_token',
-                'A valid Bearer token is required.',
-                array('status' => 401)
-            );
-        }
-
-        $token_hash = hash('sha256', $matches[1]);
-
-        global $wpdb;
-
-        $table = $this->token_table();
-
-        $now = time();
-
-        // Retrieve token information.
-        $token_row = $wpdb->get_row(
-            $wpdb->prepare(
-                "SELECT user_id, last_used_at
-                 FROM {$table}
-                 WHERE token_hash = %s
-                 AND expires_at > %s
-                 LIMIT 1",
-                $token_hash,
-                gmdate('Y-m-d H:i:s', $now)
-            )
-        );
-
-        if (!$token_row) {
-
-            return new WP_Error(
-                'invalid_or_expired_token',
-                'Your session is invalid or has expired. Please sign in again.',
-                array('status' => 401)
-            );
-        }
-
-        // Calculate last activity.
-        $last_used = $token_row->last_used_at
-            ? strtotime($token_row->last_used_at . ' UTC')
-            : false;
-
-        // Revoke inactive token.
-        if (
-            !$last_used ||
-            ($now - $last_used) >= self::INACTIVITY_TIMEOUT
-        ) {
-
-            $wpdb->delete(
-                $table,
-                array(
-                    'token_hash' => $token_hash,
-                ),
-                array('%s')
-            );
-
-            return new WP_Error(
-                'session_inactive',
-                'Your session expired due to inactivity. Please sign in again.',
-                array('status' => 401)
-            );
-        }
-
-        // Retrieve WordPress user.
-        $user = get_user_by(
-            'id',
-            (int) $token_row->user_id
-        );
-
-        if (!$user) {
-
-            $wpdb->delete(
-                $table,
-                array(
-                    'token_hash' => $token_hash,
-                ),
-                array('%s')
-            );
-
-            return new WP_Error(
-                'user_not_found',
-                'The account associated with this session no longer exists.',
-                array('status' => 401)
-            );
-        }
-
-        // Revalidate VTU Press account on every authenticated request.
-        $account_check = $this->validate_vtupress_account($user);
-
-        if (is_wp_error($account_check)) {
-
-            // Immediately revoke all sessions if account is suspended.
-            if (
-                $account_check->get_error_code() === 'account_suspended'
-            ) {
-
-                $this->revoke_user_sessions($user->ID);
-            }
-
-            return $account_check;
-        }
-
-        // Set authenticated WordPress user.
-        wp_set_current_user($user->ID);
-
-        // Refresh last activity.
-        $wpdb->update(
-            $table,
-            array(
-                'last_used_at' => gmdate(
-                    'Y-m-d H:i:s',
-                    $now
-                ),
-            ),
-            array(
-                'token_hash' => $token_hash,
-            ),
-            array('%s'),
-            array('%s')
-        );
-
-        return true;
-    }
-
-    /**
-     * Current authenticated user endpoint.
-     */
-    public function get_me(WP_REST_Request $request) {
-
-        $user = wp_get_current_user();
-
-        if (!$user || !$user->exists()) {
-
-            return $this->response(array(
-                'success' => false,
-                'message' => 'Authenticated user could not be loaded.',
-            ), 401);
-        }
-
-        return $this->response(array(
-            'success' => true,
-            'user' => $this->public_user_data($user),
-        ));
-    }
-
-    /**
-     * Heartbeat endpoint.
-     *
-     * The permission callback authenticates the token
-     * and updates its last_used_at timestamp.
-     */
-    public function heartbeat(WP_REST_Request $request) {
-
-        return $this->response(array(
-            'success' => true,
-            'message' => 'Session is active.',
-            'server_time' => gmdate('c'),
-        ));
     }
 
     /**
