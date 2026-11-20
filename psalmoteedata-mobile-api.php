@@ -182,6 +182,13 @@ final class PsalmoteeData_Mobile_API {
             'callback' => array($this, 'get_wallet_history'),
             'permission_callback' => array($this, 'authenticate_request'),
         ));
+        
+        // Current authenticated user's service transaction history.
+        register_rest_route(self::REST_NAMESPACE, '/transactions', array(
+            'methods' => WP_REST_Server::READABLE,
+            'callback' => array($this, 'get_service_transaction_history'),
+            'permission_callback' => array($this, 'authenticate_request'),
+        ));
 
         // Heartbeat.
         register_rest_route(self::REST_NAMESPACE, '/heartbeat', array(
@@ -1303,6 +1310,177 @@ final class PsalmoteeData_Mobile_API {
                 'balance_after' => round((float) $transaction['now_amount'], 2),
                 'status' => (string) $transaction['status'],
                 'date' => (string) $transaction['the_time'],
+            );
+        }
+
+        return $this->response(array(
+            'success' => true,
+            'transactions' => $formatted_transactions,
+            'pagination' => array(
+                'current_page' => $page,
+                'per_page' => $per_page,
+                'total' => $total,
+                'total_pages' => (int) ceil($total / $per_page),
+            ),
+        ));
+    }
+
+    /**
+     * Get the authenticated user's service transaction history.
+     *
+     * Retrieves the authenticated WordPress user's linked VTU Press
+     * account and queries service transactions using the VTU Press ID.
+     *
+     * Supports pagination through page and per_page parameters.
+     */
+    public function get_service_transaction_history(WP_REST_Request $request)
+    {
+        global $wpdb;
+
+        $wp_user_id = get_current_user_id();
+
+        if (!$wp_user_id) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Authenticated user could not be identified.',
+            ), 401);
+        }
+
+        // Confirm that the VTU Press Users class is available.
+        if (
+            !class_exists('Users') ||
+            !method_exists('Users', 'getUser')
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Transaction service is currently unavailable.',
+            ), 503);
+        }
+
+        // Retrieve the VTU Press account using the WordPress user ID.
+        $users_api = new Users();
+
+        $vt_user = $users_api->getUser(
+            $wp_user_id,
+            true,
+            true
+        );
+
+        if (
+            !$vt_user ||
+            !is_array($vt_user) ||
+            empty($vt_user['id'])
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Your transaction account could not be found.',
+            ), 404);
+        }
+
+        // Use the VTU Press internal user ID.
+        $vtu_user_id = (int) $vt_user['id'];
+
+        // Pagination parameters.
+        $page = max(1, absint($request->get_param('page')));
+
+        $per_page = absint($request->get_param('per_page'));
+
+        if ($per_page < 1) {
+            $per_page = 20;
+        }
+
+        // Prevent excessively large requests.
+        $per_page = min($per_page, 100);
+
+        $offset = ($page - 1) * $per_page;
+
+        // VTU Press service transactions table.
+        $transactions_table = $wpdb->prefix . 'vtupress_transactions';
+
+        // Count the user's service transactions.
+        $total = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT COUNT(*)
+                FROM {$transactions_table}
+                WHERE user_id = %d",
+                $vtu_user_id
+            )
+        );
+
+        if ($total === null) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to retrieve service transaction history.',
+            ), 500);
+        }
+
+        $total = (int) $total;
+
+        // Retrieve the user's transactions, newest first.
+        $transactions = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT
+                    id,
+                    service,
+                    recipient,
+                    amount,
+                    status,
+                    via,
+                    reference,
+                    balance_before,
+                    balance_now,
+                    description,
+                    set_country,
+                    created_at
+                FROM {$transactions_table}
+                WHERE user_id = %d
+                ORDER BY id DESC
+                LIMIT %d OFFSET %d",
+                $vtu_user_id,
+                $per_page,
+                $offset
+            ),
+            ARRAY_A
+        );
+
+        if ($transactions === null) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to retrieve service transactions.',
+            ), 500);
+        }
+
+        // Format transaction records for the mobile application.
+        $formatted_transactions = array();
+
+        foreach ($transactions as $transaction) {
+
+            // Balance columns are TEXT in the VTU Press database.
+            $balance_before = is_numeric($transaction['balance_before'])
+                ? round((float) $transaction['balance_before'], 2)
+                : null;
+
+            $balance_after = is_numeric($transaction['balance_now'])
+                ? round((float) $transaction['balance_now'], 2)
+                : null;
+
+            $formatted_transactions[] = array(
+                'id' => (int) $transaction['id'],
+                'service' => (string) $transaction['service'],
+                'recipient' => (string) $transaction['recipient'],
+                'amount' => round((float) $transaction['amount'], 2),
+                'status' => (string) ($transaction['status'] ?? ''),
+                'via' => (string) ($transaction['via'] ?? ''),
+                'reference' => (string) $transaction['reference'],
+                'balance_before' => $balance_before,
+                'balance_after' => $balance_after,
+                'description' => $transaction['description'] !== null
+                    ? (string) $transaction['description']
+                    : null,
+                'country' => (string) $transaction['set_country'],
+                'date' => $transaction['created_at'] !== null
+                    ? (string) $transaction['created_at']
+                    : null,
             );
         }
 
