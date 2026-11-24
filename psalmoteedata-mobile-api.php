@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PsalmoteeData Mobile API
  * Description: Secure mobile authentication endpoints for the PsalmoteeData app.
- * Version: 0.7.0
+ * Version: 0.8.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Author: Psalmotee-Tech
@@ -15,7 +15,7 @@ if (!defined('ABSPATH')) {
 
 final class PsalmoteeData_Mobile_API {
 
-    const VERSION = '0.7.0';
+    const VERSION = '0.8.0';
     const REST_NAMESPACE = 'psalmoteedata-mobile/v1';
 
     // Maximum lifetime of an authentication token.
@@ -187,6 +187,20 @@ final class PsalmoteeData_Mobile_API {
         register_rest_route(self::REST_NAMESPACE, '/transactions', array(
             'methods' => WP_REST_Server::READABLE,
             'callback' => array($this, 'get_service_transaction_history'),
+            'permission_callback' => array($this, 'authenticate_request'),
+        ));
+
+        // Current authenticated user's virtual accounts.
+        register_rest_route(self::REST_NAMESPACE, '/virtual-accounts', array(
+            'methods' => WP_REST_Server::READABLE,
+            'callback' => array($this, 'get_virtual_accounts'),
+            'permission_callback' => array($this, 'authenticate_request'),
+        ));
+
+        // Generate virtual accounts for the authenticated user.
+        register_rest_route(self::REST_NAMESPACE, '/virtual-accounts/generate', array(
+            'methods' => WP_REST_Server::CREATABLE,
+            'callback' => array($this, 'generate_virtual_accounts'),
             'permission_callback' => array($this, 'authenticate_request'),
         ));
 
@@ -1622,6 +1636,501 @@ final class PsalmoteeData_Mobile_API {
                 'total' => $total,
                 'total_pages' => (int) ceil($total / $per_page),
             ),
+        ));
+    }
+
+    /**
+     * Get the authenticated user's saved virtual accounts.
+     *
+     * WordPress user ID is resolved to the VTU Press internal
+     * user ID before querying vtupress_userAccounts.
+     */
+    public function get_virtual_accounts(WP_REST_Request $request)
+    {
+        global $wpdb;
+
+        $wp_user_id = get_current_user_id();
+
+        if (!$wp_user_id) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Authenticated user could not be identified.',
+            ), 401);
+        }
+
+        // Confirm VTU Press user service is available.
+        if (
+            !class_exists('Users') ||
+            !method_exists('Users', 'getUser')
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Virtual account service is currently unavailable.',
+            ), 503);
+        }
+
+        // Resolve WordPress user ID to VTU Press internal user ID.
+        $users_api = new Users();
+
+        $vt_user = $users_api->getUser(
+            $wp_user_id,
+            true,
+            true
+        );
+
+        if (
+            !$vt_user ||
+            !is_array($vt_user) ||
+            empty($vt_user['id'])
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Your VTU Press account could not be found.',
+            ), 404);
+        }
+
+        $vt_user_id = (int) $vt_user['id'];
+
+        $accounts_table = $wpdb->prefix . 'vtupress_userAccounts';
+
+        // Retrieve only the authenticated user's saved accounts.
+        $accounts = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT
+                    id,
+                    bankName,
+                    accountName,
+                    accountNumber,
+                    accountRef,
+                    gateway,
+                    created_at,
+                    updated_at
+                FROM {$accounts_table}
+                WHERE userId = %d
+                ORDER BY id DESC",
+                $vt_user_id
+            ),
+            ARRAY_A
+        );
+
+        if ($accounts === null) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to retrieve virtual accounts.',
+            ), 500);
+        }
+
+        $formatted_accounts = array();
+        $seen_accounts = array();
+
+        foreach ($accounts as $account) {
+
+            $account_number = trim((string) ($account['accountNumber'] ?? ''));
+            $gateway = strtolower(trim((string) ($account['gateway'] ?? '')));
+
+            // Ignore incomplete account records.
+            if ($account_number === '' || $gateway === '') {
+                continue;
+            }
+
+            // Ignore obvious placeholder account numbers.
+            if ($account_number === '1') {
+                continue;
+            }
+
+            // Prevent duplicate accounts for the same gateway.
+            $unique_key = $gateway . ':' . $account_number;
+
+            if (isset($seen_accounts[$unique_key])) {
+                continue;
+            }
+
+            $seen_accounts[$unique_key] = true;
+
+            $formatted_accounts[] = array(
+                'id' => (int) $account['id'],
+                'bank_name' => (string) $account['bankName'],
+                'account_name' => (string) $account['accountName'],
+                'account_number' => $account_number,
+                'account_reference' => (string) ($account['accountRef'] ?? ''),
+                'gateway' => $gateway,
+                'created_at' => $account['created_at'] ?? null,
+                'updated_at' => $account['updated_at'] ?? null,
+            );
+        }
+
+        return $this->response(array(
+            'success' => true,
+            'accounts' => $formatted_accounts,
+            'total' => count($formatted_accounts),
+        ));
+    }
+
+    /**
+     * Generate virtual accounts across all eligible VTU Press gateways.
+     *
+     * The authenticated WordPress user ID is passed to each gateway.
+     * Existing valid accounts are not regenerated.
+     */
+    public function generate_virtual_accounts(WP_REST_Request $request)
+    {
+        global $wpdb;
+
+        $wp_user_id = get_current_user_id();
+
+        if (!$wp_user_id) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Authenticated user could not be identified.',
+            ), 401);
+        }
+
+        // Check required VTU Press services.
+        if (
+            !class_exists('Users') ||
+            !class_exists('Vtupress_Gateway_Container') ||
+            !class_exists('Vtupress_Option')
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Virtual account services are currently unavailable.',
+            ), 503);
+        }
+
+        // Resolve WordPress user to VTU Press user.
+        $users_api = new Users();
+
+        $vp_user = $users_api->getUser(
+            $wp_user_id,
+            false,
+            true
+        );
+
+        if (empty($vp_user) || empty($vp_user->id)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Your VTU Press account could not be found.',
+            ), 404);
+        }
+
+        $vp_user_id = (int) $vp_user->id;
+
+        // Check global banking availability.
+        $banking_enabled = Vtupress_Option::get('banking', 'yes') === 'yes';
+
+        if (!$banking_enabled) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Virtual banking is currently disabled.',
+            ), 403);
+        }
+
+        // Check whether virtual payments are enabled.
+        $manual_gateway = Vtupress_Gateway_Container::get('manual');
+
+        if (!$manual_gateway) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Virtual account configuration is unavailable.',
+            ), 503);
+        }
+
+        $manual_settings = $manual_gateway->get_settings();
+
+        if (($manual_settings['virtual_payment'] ?? 'no') !== 'yes') {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Virtual account generation is currently disabled.',
+            ), 403);
+        }
+
+        // Retrieve all gateways available in the current VTU Press context.
+        $gateways = Vtupress_Gateway_Container::all();
+
+        if (empty($gateways)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'No virtual account gateways are currently available.',
+            ), 503);
+        }
+
+        $accounts_table = $wpdb->prefix . 'vtupress_userAccounts';
+
+        // Retrieve existing accounts for this VTU Press user.
+        $existing_accounts = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT gateway, accountNumber
+                FROM {$accounts_table}
+                WHERE userId = %d",
+                $vp_user_id
+            ),
+            ARRAY_A
+        );
+
+        if ($existing_accounts === null) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to check your existing virtual accounts.',
+            ), 500);
+        }
+
+        // Identify gateways that already have valid accounts.
+        $existing_gateways = array();
+
+        foreach ($existing_accounts as $account) {
+
+            $gateway_id = strtolower(trim((string) ($account['gateway'] ?? '')));
+            $account_number = trim((string) ($account['accountNumber'] ?? ''));
+
+            if (
+                $gateway_id !== '' &&
+                $account_number !== '' &&
+                $account_number !== '1'
+            ) {
+                $existing_gateways[$gateway_id] = true;
+            }
+        }
+
+        $results = array();
+
+        foreach ($gateways as $gateway_id => $gateway) {
+
+            $gateway_id = strtolower((string) $gateway_id);
+
+            // Ignore gateways without virtual account support.
+            if (empty($gateway->virtual_account)) {
+                continue;
+            }
+
+            $settings = $gateway->get_settings();
+
+            // Ignore inactive gateways.
+            if (($settings['status'] ?? 'inactive') !== 'active') {
+                continue;
+            }
+
+            // Check configured banks.
+            $saved_raw = Vtupress_Option::get(
+                $gateway->get_option_key(),
+                array()
+            );
+
+            $saved_banks = isset($saved_raw['banks'])
+                ? trim((string) $saved_raw['banks'])
+                : '';
+
+            // Ignore gateways without configured banks.
+            if ($saved_banks === '') {
+                continue;
+            }
+
+            // Do not regenerate an account that already exists.
+            if (isset($existing_gateways[$gateway_id])) {
+
+                $results[] = array(
+                    'gateway' => $gateway_id,
+                    'status' => 'already_exists',
+                    'message' => 'A valid account already exists for this gateway.',
+                );
+
+                continue;
+            }
+
+            // Phone number is required by the existing VTU Press account renderer.
+            if (empty($vp_user->phone)) {
+
+                $results[] = array(
+                    'gateway' => $gateway_id,
+                    'status' => 'profile_required',
+                    'message' => 'Please add your phone number to your profile.',
+                );
+
+                continue;
+            }
+
+            // Check gateway-specific BVN requirement.
+            $requires_bvn = strtolower(
+                (string) ($settings['requires_bvn'] ?? 'no')
+            ) === 'yes';
+
+            if ($requires_bvn && empty($vp_user->bvn)) {
+
+                $results[] = array(
+                    'gateway' => $gateway_id,
+                    'status' => 'profile_required',
+                    'message' => 'Please add your BVN to your profile.',
+                );
+
+                continue;
+            }
+
+            // Check gateway-specific NIN requirement.
+            $requires_nin = strtolower(
+                (string) ($settings['requires_nin'] ?? 'no')
+            ) === 'yes';
+
+            if ($requires_nin && empty($vp_user->nin)) {
+
+                $results[] = array(
+                    'gateway' => $gateway_id,
+                    'status' => 'profile_required',
+                    'message' => 'Please add your NIN to your profile.',
+                );
+
+                continue;
+            }
+
+            // Confirm that the gateway implements account generation.
+            if (!method_exists($gateway, 'create_virtual_account')) {
+                continue;
+            }
+
+            try {
+
+                // Gateway expects the WordPress user ID, not the VTU Press ID.
+                $generation = $gateway->create_virtual_account($wp_user_id);
+
+                if (
+                    is_array($generation) &&
+                    ($generation['status'] ?? '') === 'success'
+                ) {
+
+                    $results[] = array(
+                        'gateway' => $gateway_id,
+                        'status' => 'success',
+                        'message' => 'Account generation request completed.',
+                    );
+
+                } else {
+
+                    $results[] = array(
+                        'gateway' => $gateway_id,
+                        'status' => 'failed',
+                        'message' => 'The gateway could not generate an account.',
+                    );
+                }
+
+            } catch (Throwable $exception) {
+
+                // Log technical details without exposing them to the mobile app.
+                error_log(
+                    'PsalmoteeData virtual account generation failed for ' .
+                    $gateway_id . ': ' . $exception->getMessage()
+                );
+
+                $results[] = array(
+                    'gateway' => $gateway_id,
+                    'status' => 'failed',
+                    'message' => 'An error occurred while generating this account.',
+                );
+            }
+        }
+
+        // Count gateway outcomes.
+        $generated = 0;
+        $failed = 0;
+        $already_exists = 0;
+        $profile_required = 0;
+
+        foreach ($results as $result) {
+
+            switch ($result['status']) {
+
+                case 'success':
+                    $generated++;
+                    break;
+
+                case 'failed':
+                    $failed++;
+                    break;
+
+                case 'already_exists':
+                    $already_exists++;
+                    break;
+
+                case 'profile_required':
+                    $profile_required++;
+                    break;
+            }
+        }
+
+        // Retrieve the latest saved accounts after generation.
+        $saved_accounts = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT
+                    id,
+                    bankName,
+                    accountName,
+                    accountNumber,
+                    accountRef,
+                    gateway,
+                    created_at,
+                    updated_at
+                FROM {$accounts_table}
+                WHERE userId = %d
+                ORDER BY id DESC",
+                $vp_user_id
+            ),
+            ARRAY_A
+        );
+
+        if ($saved_accounts === null) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to retrieve your virtual accounts after generation.',
+            ), 500);
+        }
+
+        $formatted_accounts = array();
+        $seen_accounts = array();
+
+        foreach ($saved_accounts as $account) {
+
+            $account_number = trim((string) ($account['accountNumber'] ?? ''));
+            $account_gateway = strtolower(trim((string) ($account['gateway'] ?? '')));
+
+            // Ignore incomplete account records and placeholders.
+            if (
+                $account_number === '' ||
+                $account_number === '1' ||
+                $account_gateway === ''
+            ) {
+                continue;
+            }
+
+            // Prevent duplicate accounts for the same gateway.
+            $unique_key = $account_gateway . ':' . $account_number;
+
+            if (isset($seen_accounts[$unique_key])) {
+                continue;
+            }
+
+            $seen_accounts[$unique_key] = true;
+
+            $formatted_accounts[] = array(
+                'id' => (int) $account['id'],
+                'bank_name' => (string) $account['bankName'],
+                'account_name' => (string) $account['accountName'],
+                'account_number' => $account_number,
+                'account_reference' => (string) ($account['accountRef'] ?? ''),
+                'gateway' => $account_gateway,
+                'created_at' => $account['created_at'] ?? null,
+                'updated_at' => $account['updated_at'] ?? null,
+            );
+        }
+
+        return $this->response(array(
+            'success' => true,
+            'message' => 'Virtual account generation process completed.',
+            'summary' => array(
+                'generated' => $generated,
+                'failed' => $failed,
+                'already_exists' => $already_exists,
+                'profile_required' => $profile_required,
+                'total_accounts' => count($formatted_accounts),
+            ),
+            'results' => $results,
+            'accounts' => $formatted_accounts,
         ));
     }
 
