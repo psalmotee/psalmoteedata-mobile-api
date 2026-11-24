@@ -1417,6 +1417,7 @@ final class PsalmoteeData_Mobile_API {
         $total = (int) $total;
 
         // Retrieve the user's transactions, newest first.
+        // The details column contains additional VTU Press transaction data.
         $transactions = $wpdb->get_results(
             $wpdb->prepare(
                 "SELECT
@@ -1431,7 +1432,8 @@ final class PsalmoteeData_Mobile_API {
                     balance_now,
                     description,
                     set_country,
-                    created_at
+                    created_at,
+                    details
                 FROM {$transactions_table}
                 WHERE user_id = %d
                 ORDER BY id DESC
@@ -1450,10 +1452,118 @@ final class PsalmoteeData_Mobile_API {
             ), 500);
         }
 
+        // Safely retrieve a scalar value from transaction details.
+        $get_detail_value = function ($details, $keys, $default = '') {
+
+            foreach ($keys as $key) {
+
+                if (
+                    isset($details[$key]) &&
+                    is_scalar($details[$key]) &&
+                    trim((string) $details[$key]) !== ''
+                ) {
+                    return trim((string) $details[$key]);
+                }
+            }
+
+            return $default;
+        };
+
         // Format transaction records for the mobile application.
         $formatted_transactions = array();
 
         foreach ($transactions as $transaction) {
+
+            // Decode the VTU Press details JSON.
+            $details = array();
+
+            if (!empty($transaction['details'])) {
+                $decoded_details = json_decode(
+                    $transaction['details'],
+                    true
+                );
+
+                if (is_array($decoded_details)) {
+                    $details = $decoded_details;
+                }
+            }
+
+            $service = strtolower(
+                (string) $transaction['service']
+            );
+
+            // Resolve the actual recipient.
+            // VTU Press may store "system" in the database recipient column.
+            $recipient = $get_detail_value(
+                $details,
+                array('recipient', 'mobile_number', 'phone_number')
+            );
+
+            if (
+                $recipient === '' &&
+                strtolower((string) $transaction['recipient']) !== 'system'
+            ) {
+                $recipient = (string) $transaction['recipient'];
+            }
+
+            // Resolve the purchased plan.
+            $plan = '';
+
+            if ($service === 'airtime') {
+                $plan = $get_detail_value(
+                    $details,
+                    array('plan_amount', 'amount')
+                );
+            } elseif ($service === 'data') {
+                $plan = $get_detail_value(
+                    $details,
+                    array('plan_text', 'dataplan', 'plan')
+                );
+            } else {
+                $plan = $get_detail_value(
+                    $details,
+                    array('plan_text', 'dataplan', 'plan', 'plan_amount')
+                );
+            }
+
+            // Resolve provider/network.
+            $provider = $get_detail_value(
+                $details,
+                array('provider', 'plan_network', 'network')
+            );
+
+            // Resolve transaction type.
+            // Airtime uses airtime_type, while data uses type.
+            if ($service === 'airtime') {
+                $type = $get_detail_value(
+                    $details,
+                    array('airtime_type', 'type')
+                );
+            } else {
+                $type = $get_detail_value(
+                    $details,
+                    array('type', 'plan_type')
+                );
+            }
+
+            // Resolve reference, status, and payment channel.
+            $reference = $get_detail_value(
+                $details,
+                array('ref', 'transid', 'request-id'),
+                (string) $transaction['reference']
+            );
+
+            $status = $get_detail_value(
+                $details,
+                array('status', 'Status'),
+                (string) ($transaction['status'] ?? '')
+            );
+
+            $via = $get_detail_value(
+                $details,
+                array('via'),
+                (string) ($transaction['via'] ?? '')
+            );
 
             // Balance columns are TEXT in the VTU Press database.
             $balance_before = is_numeric($transaction['balance_before'])
@@ -1464,23 +1574,42 @@ final class PsalmoteeData_Mobile_API {
                 ? round((float) $transaction['balance_now'], 2)
                 : null;
 
+            // Use the transaction table amount as the recorded transaction amount.
+            // Do not substitute details.amount or paid_amount because VTU Press
+            // records can contain different values in these fields.
+            $amount = round((float) $transaction['amount'], 2);
+
+            // Use the transaction table date, with create_date as a fallback.
+            $date = $transaction['created_at'] !== null
+                ? (string) $transaction['created_at']
+                : $get_detail_value(
+                    $details,
+                    array('create_date'),
+                    null
+                );
+
             $formatted_transactions[] = array(
                 'id' => (int) $transaction['id'],
                 'service' => (string) $transaction['service'],
-                'recipient' => (string) $transaction['recipient'],
-                'amount' => round((float) $transaction['amount'], 2),
-                'status' => (string) ($transaction['status'] ?? ''),
-                'via' => (string) ($transaction['via'] ?? ''),
-                'reference' => (string) $transaction['reference'],
+                'recipient' => $recipient,
+                'amount' => $amount,
+                'status' => $status,
+                'via' => $via,
+                'reference' => $reference,
+
+                // Additional receipt information.
+                'plan' => $plan,
+                'provider' => $provider,
+                'type' => $type,
+
+                // Existing history fields retained for compatibility.
                 'balance_before' => $balance_before,
                 'balance_after' => $balance_after,
                 'description' => $transaction['description'] !== null
                     ? (string) $transaction['description']
                     : null,
                 'country' => (string) $transaction['set_country'],
-                'date' => $transaction['created_at'] !== null
-                    ? (string) $transaction['created_at']
-                    : null,
+                'date' => $date,
             );
         }
 
