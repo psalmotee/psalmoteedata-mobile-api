@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PsalmoteeData Mobile API
  * Description: Secure mobile authentication endpoints for the PsalmoteeData app.
- * Version: 0.8.0
+ * Version: 0.9.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Author: Psalmotee-Tech
@@ -15,7 +15,7 @@ if (!defined('ABSPATH')) {
 
 final class PsalmoteeData_Mobile_API {
 
-    const VERSION = '0.8.0';
+    const VERSION = '0.9.0';
     const REST_NAMESPACE = 'psalmoteedata-mobile/v1';
 
     // Maximum lifetime of an authentication token.
@@ -201,6 +201,13 @@ final class PsalmoteeData_Mobile_API {
         register_rest_route(self::REST_NAMESPACE, '/virtual-accounts/generate', array(
             'methods' => WP_REST_Server::CREATABLE,
             'callback' => array($this, 'generate_virtual_accounts'),
+            'permission_callback' => array($this, 'authenticate_request'),
+        ));
+
+        // Purchase Airtime for the authenticated user.
+        register_rest_route(self::REST_NAMESPACE, '/airtime/purchase', array(
+            'methods' => WP_REST_Server::CREATABLE,
+            'callback' => array($this, 'purchase_airtime'),
             'permission_callback' => array($this, 'authenticate_request'),
         ));
 
@@ -2131,6 +2138,408 @@ final class PsalmoteeData_Mobile_API {
             ),
             'results' => $results,
             'accounts' => $formatted_accounts,
+        ));
+    }
+
+    /**
+     * Purchase Airtime through the existing VTU Press transaction engine.
+     *
+     * Accepts:
+     * - pin
+     * - network
+     * - type
+     * - phone_number
+     * - amount
+     * - request_id
+     * - ported_number (optional Boolean, defaults to false)
+     *
+     * The request_id must remain the same when retrying the same
+     * purchase request. This allows VTU Press to detect duplicate
+     * transaction references.
+     */
+    public function purchase_airtime(WP_REST_Request $request)
+    {
+        global $wpdb;
+
+        // Get the authenticated WordPress user.
+        $wp_user_id = get_current_user_id();
+
+        if (!$wp_user_id) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Authenticated user could not be identified.',
+            ), 401);
+        }
+
+        // Collect request parameters.
+        $pin = trim((string) $request->get_param('pin'));
+
+        $network = strtolower(trim(
+            sanitize_text_field((string) $request->get_param('network'))
+        ));
+
+        $type = strtolower(trim(
+            sanitize_text_field((string) $request->get_param('type'))
+        ));
+
+        $phone_number = trim(
+            sanitize_text_field((string) $request->get_param('phone_number'))
+        );
+
+        $amount_input = $request->get_param('amount');
+
+        $request_id = trim(
+            sanitize_text_field((string) $request->get_param('request_id'))
+        );
+
+        // Read the ported number option.
+        // Defaults to false when the app does not provide it.
+        $ported_number_input = $request->get_param('ported_number');
+
+        if ($ported_number_input === null) {
+            $ported_number = false;
+        } elseif (is_bool($ported_number_input)) {
+            $ported_number = $ported_number_input;
+        } else {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Invalid ported number option.',
+            ), 400);
+        }
+
+        // Validate required fields.
+        if (
+            $pin === '' ||
+            $network === '' ||
+            $type === '' ||
+            $phone_number === '' ||
+            $amount_input === null ||
+            $request_id === ''
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'PIN, network, type, phone number, amount and request ID are required.',
+            ), 400);
+        }
+
+        // Validate the four-digit transaction PIN.
+        if (!preg_match('/^[0-9]{4}$/', $pin)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Please enter a valid four-digit transaction PIN.',
+            ), 400);
+        }
+
+        // Validate the request ID.
+        if (!preg_match('/^[a-zA-Z0-9_-]{8,64}$/', $request_id)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Invalid transaction request ID.',
+            ), 400);
+        }
+
+        // Validate phone number.
+        if (!preg_match('/^[0-9]{7,15}$/', $phone_number)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Please provide a valid recipient phone number.',
+            ), 400);
+        }
+
+        // Validate Airtime amount.
+        if (
+            !is_numeric($amount_input) ||
+            !is_finite((float) $amount_input) ||
+            (float) $amount_input <= 0
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Please provide a valid Airtime amount.',
+            ), 400);
+        }
+
+        $amount = (float) $amount_input;
+
+        // Confirm VTU Press services are available.
+        if (
+            !class_exists('Users') ||
+            !class_exists('Vtupress_Service_Container')
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Airtime services are currently unavailable.',
+            ), 503);
+        }
+
+        // Retrieve the VTU Press account using the WordPress user ID.
+        $users_api = new Users();
+
+        $vt_user = $users_api->getUser(
+            $wp_user_id,
+            true,
+            true
+        );
+
+        if (
+            !$vt_user ||
+            !is_array($vt_user) ||
+            empty($vt_user['id'])
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Your VTU Press account could not be found.',
+            ), 404);
+        }
+
+        $vtu_user_id = (int) $vt_user['id'];
+
+        // Validate transaction PIN using VTU Press.
+        if (!method_exists($users_api, 'verifyPin')) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Transaction PIN verification is unavailable.',
+            ), 503);
+        }
+
+        if (!$users_api->verifyPin($vtu_user_id, (int) $pin)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Incorrect transaction PIN.',
+            ), 403);
+        }
+
+        // Generate a stable reference for this purchase request.
+        $reference = 'PTD-AIR-' . $wp_user_id . '-' . $request_id;
+
+        // Prevent resubmitting an existing non-failed transaction.
+        $transactions_table = $wpdb->prefix . 'vtupress_transactions';
+
+        $existing_transaction = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT id
+                FROM {$transactions_table}
+                WHERE reference = %s
+                AND status != 'failed'
+                LIMIT 1",
+                $reference
+            )
+        );
+
+        if ($existing_transaction) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'This purchase request has already been submitted. Please check your transaction history.',
+                'reference' => $reference,
+            ), 409);
+        }
+
+        // Retrieve the main Airtime service.
+        $main_service = Vtupress_Service_Container::get(
+            'airtime',
+            false,
+            $wp_user_id
+        );
+
+        if (!$main_service) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Airtime service is unavailable for your account region.',
+            ), 503);
+        }
+
+        try {
+            $main_service->boot();
+        } catch (Throwable $exception) {
+            error_log(
+                'PsalmoteeData Mobile API: Airtime service initialization failed.'
+            );
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to initialize Airtime service.',
+            ), 503);
+        }
+
+        if (empty($main_service->status)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Airtime service is currently disabled.',
+            ), 403);
+        }
+
+        // Confirm that the requested Airtime type is supported.
+        $main_settings = $main_service->get_settings();
+
+        $supported_types = $main_settings['service_types']
+            ?? $main_service->service_types;
+
+        if (!in_array($type, $supported_types, true)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Airtime type is not supported.',
+            ), 400);
+        }
+
+        // Retrieve the Airtime service for the selected type.
+        $service = Vtupress_Service_Container::get(
+            'airtime',
+            $type,
+            $wp_user_id
+        );
+
+        if (!$service) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Airtime service is unavailable.',
+            ), 503);
+        }
+
+        try {
+            $service->boot();
+
+            $settings = $service->get_settings(false);
+
+        } catch (Throwable $exception) {
+            error_log(
+                'PsalmoteeData Mobile API: Airtime type initialization failed.'
+            );
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to initialize the selected Airtime type.',
+            ), 503);
+        }
+
+        // Check whether the selected Airtime type is enabled.
+        if (
+            isset($settings['enable']) &&
+            $settings['enable'] !== 'yes'
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Airtime type is currently disabled.',
+            ), 403);
+        }
+
+        // Validate the selected network against VTU Press configuration.
+        if (
+            !method_exists($service, 'is_provider_enabled_for_type') ||
+            !in_array(
+                $network,
+                array_map('strtolower', $service->providers),
+                true
+            ) ||
+            !$service->is_provider_enabled_for_type($network, $type)
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected network is unavailable for this Airtime type.',
+            ), 400);
+        }
+
+        // Build the payload expected by the VTU Press Airtime service.
+        // The PIN is deliberately excluded from the transaction payload.
+        $payload = array(
+            'type' => $type,
+            'provider' => $network,
+            'recipient' => $phone_number,
+            'amount' => $amount,
+            'ref' => $reference,
+
+            // Overrides the configured VTU Press Post Data 1 value.
+            'post_data_1' => $ported_number,
+        );
+        // Process the purchase through VTU Press.
+        // VTU Press handles pricing, wallet debit, provider execution,
+        // transaction logging and refunds.
+        try {
+            $result = $service->process_transaction(
+                $settings,
+                $users_api,
+                $vt_user,
+                'api',
+                $payload
+            );
+
+        } catch (Throwable $exception) {
+            error_log(
+                'PsalmoteeData Mobile API: Airtime processing exception. Reference: ' .
+                $reference
+            );
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'We could not confirm the transaction result. Please check your transaction history before trying again.',
+                'reference' => $reference,
+                'status' => 'unknown',
+            ), 500);
+        }
+
+        // Ensure VTU Press returned a valid result.
+        if (!is_array($result) || empty($result['status'])) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The transaction result could not be confirmed. Please check your transaction history.',
+                'reference' => $reference,
+                'status' => 'unknown',
+            ), 500);
+        }
+
+        $raw_status = strtolower((string) $result['status']);
+
+        // Distinguish successful, processing and failed transactions.
+        if (
+            $raw_status === 'success' &&
+            !empty($result['is_processing'])
+        ) {
+            $transaction_status = 'processing';
+
+        } elseif (
+            $raw_status === 'processing'
+        ) {
+            $transaction_status = 'processing';
+
+        } elseif (
+            $raw_status === 'success'
+        ) {
+            $transaction_status = 'successful';
+
+        } else {
+            $transaction_status = 'failed';
+        }
+
+        // Retrieve the latest wallet balance.
+        $wallet_balance = null;
+
+        if (method_exists($users_api, 'getBalance')) {
+            $wallet_balance = round(
+                (float) $users_api->getBalance($vtu_user_id),
+                2
+            );
+        }
+
+        // Return a safe transaction response.
+        return $this->response(array(
+            'success' => true,
+            'message' => (string) (
+                $result['message'] ??
+                'Airtime transaction processed.'
+            ),
+            'transaction' => array(
+                'reference' => $reference,
+                'transaction_id' => $result['transaction_id'] ?? null,
+                'service' => 'airtime',
+                'network' => $network,
+                'type' => $type,
+                'recipient' => $phone_number,
+                'amount' => round($amount, 2),
+                'charged_amount' => isset($result['charged'])
+                    && is_numeric($result['charged'])
+                        ? round((float) $result['charged'], 2)
+                        : null,
+                'status' => $transaction_status,
+                'wallet_balance' => $wallet_balance,
+            ),
         ));
     }
 
