@@ -211,6 +211,13 @@ final class PsalmoteeData_Mobile_API {
             'permission_callback' => array($this, 'authenticate_request'),
         ));
 
+        // Get an Airtime pricing quotation for the authenticated user.
+        register_rest_route(self::REST_NAMESPACE, '/airtime/quote', array(
+            'methods' => WP_REST_Server::CREATABLE,
+            'callback' => array($this, 'quote_airtime'),
+            'permission_callback' => array($this, 'authenticate_request'),
+        ));
+
         // Heartbeat.
         register_rest_route(self::REST_NAMESPACE, '/heartbeat', array(
             'methods' => WP_REST_Server::CREATABLE,
@@ -2138,6 +2145,422 @@ final class PsalmoteeData_Mobile_API {
             ),
             'results' => $results,
             'accounts' => $formatted_accounts,
+        ));
+    }
+
+    /**
+     * Convert a configured VTU Press bonus value into a monetary amount.
+     * Supports fixed amounts and percentage strings, matching VTU Press.
+     */
+    private function airtime_bonus_value_to_amount($value, $base_amount)
+    {
+        if (is_string($value) && strpos($value, '%') !== false) {
+            $percentage = (float) str_replace('%', '', $value);
+            return ($base_amount * $percentage) / 100;
+        }
+
+        return (float) $value;
+    }
+
+    /**
+     * Build an Airtime bonus breakdown using the same settings and
+     * eligibility rules used by VTU Press calculate_bonus().
+     *
+     * The authoritative total and payable values still come from
+     * calculate_pay_amount(); this method only separates the components.
+     */
+    private function get_airtime_bonus_breakdown(
+        $service,
+        array $main_settings,
+        $network,
+        $type,
+        $vtu_user_id,
+        $base_amount,
+        array $authoritative_calculation
+    ) {
+        global $wpdb;
+
+        $apply_provider_bonus = true;
+        $apply_service_bonus = true;
+
+        $users_table = $wpdb->prefix . 'vtupress_users';
+        $level_table = $wpdb->prefix . 'vtupress_levels';
+        $reward_table = $wpdb->prefix . 'vtupress_level_service_rewards';
+
+        // Match VTU Press calculate_bonus(): it looks up plan using userId.
+        $user_plan = $wpdb->get_var(
+            $wpdb->prepare(
+                "SELECT plan FROM {$users_table} WHERE userId = %d",
+                $vtu_user_id
+            )
+        );
+
+        $current_country = '';
+
+        if (class_exists('Vtupress_Country_Context')) {
+            $current_country = Vtupress_Country_Context::get(
+                get_current_user_id()
+            );
+        }
+
+        if ($user_plan) {
+            $level_settings = $wpdb->get_row(
+                $wpdb->prepare(
+                    "SELECT apply_provider_bonus, apply_service_bonus
+                     FROM {$level_table}
+                     WHERE name = %s AND set_country = %s",
+                    strtolower($user_plan),
+                    $current_country
+                )
+            );
+
+            if ($level_settings) {
+                $apply_provider_bonus = (
+                    $level_settings->apply_provider_bonus !== 'no'
+                );
+                $apply_service_bonus = (
+                    $level_settings->apply_service_bonus !== 'no'
+                );
+            }
+        }
+
+        // Provider bonus is only applied when no service bonus overrides it.
+        $provider_bonus = 0;
+        $provider_bonus_value = 0;
+
+        if ($apply_provider_bonus && !empty($service->uses_bonus)) {
+            $provider_bonus_value = $service->get_network_bonus($network);
+            $provider_bonus = $this->airtime_bonus_value_to_amount(
+                $provider_bonus_value,
+                $base_amount
+            );
+        }
+
+        $service_bonus = 0;
+        $bonus_source = $provider_bonus > 0 ? 'provider' : 'none';
+        $selected_bonus = $provider_bonus;
+
+        $service_bonus_enabled = (
+            ($main_settings['service_bonus_enable'] ?? 'no') === 'yes'
+        );
+
+        if ($apply_service_bonus && $service_bonus_enabled) {
+            $service_bonus_value = $main_settings[strtolower($type) . '_bonus'] ?? 0;
+
+            // Preserve VTU Press's !empty() override condition.
+            if (!empty($service_bonus_value)) {
+                $service_bonus = $this->airtime_bonus_value_to_amount(
+                    $service_bonus_value,
+                    $base_amount
+                );
+
+                $selected_bonus = $service_bonus;
+                $bonus_source = 'service';
+
+                // The provider bonus is available but is not applied when
+                // the service bonus overrides it.
+                $provider_bonus = 0;
+            }
+        }
+
+        // Tiered reward lookup follows VTU Press's exact lookup/fallback order.
+        $tiered_bonus_amount = 0;
+
+        if ($user_plan) {
+            $tiered_bonus_value = $wpdb->get_var(
+                $wpdb->prepare(
+                    "SELECT bonus_value FROM {$reward_table}
+                     WHERE level_name = %s
+                     AND service_id = %s
+                     AND service_type = %s
+                     AND set_country = %s
+                     AND bonus_type = 'tiered'",
+                    strtolower($user_plan),
+                    'airtime',
+                    $type,
+                    $current_country
+                )
+            );
+
+            if (
+                $tiered_bonus_value === null ||
+                $tiered_bonus_value === false
+            ) {
+                $tiered_bonus_value = $wpdb->get_var(
+                    $wpdb->prepare(
+                        "SELECT bonus_value FROM {$reward_table}
+                         WHERE level_name = %s
+                         AND service_id = %s
+                         AND (service_type = 'all' OR service_type IS NULL)
+                         AND set_country = %s
+                         AND bonus_type = 'tiered'",
+                        strtolower($user_plan),
+                        'airtime',
+                        $current_country
+                    )
+                );
+            }
+
+            if ($tiered_bonus_value && $tiered_bonus_value !== '0') {
+                $tiered_bonus_amount = $this->airtime_bonus_value_to_amount(
+                    $tiered_bonus_value,
+                    $base_amount
+                );
+            }
+        }
+
+        $calculated_total = round($selected_bonus + $tiered_bonus_amount, 2);
+        $authoritative_total = round(
+            (float) ($authoritative_calculation['bonus'] ?? 0),
+            2
+        );
+
+        // Never return a breakdown that disagrees with VTU Press's own total.
+        if (abs($calculated_total - $authoritative_total) > 0.01) {
+            return new WP_Error(
+                'airtime_pricing_mismatch',
+                'The pricing breakdown could not be verified. Please try again.',
+                array(
+                    'status' => 503,
+                    'calculated_total' => $calculated_total,
+                    'authoritative_total' => $authoritative_total,
+                )
+            );
+        }
+
+        $discount_method = $main_settings['discount_method'] ?? 'discount';
+
+        return array(
+            'original' => round((float) ($authoritative_calculation['original'] ?? $base_amount), 2),
+            'provider_bonus' => round($provider_bonus, 2),
+            'service_bonus' => round($service_bonus, 2),
+            'tiered_bonus' => round($tiered_bonus_amount, 2),
+            'total_bonus' => $authoritative_total,
+            'payable' => round((float) ($authoritative_calculation['payable'] ?? $base_amount), 2),
+            'discount_method' => (string) $discount_method,
+            'bonus_source' => $bonus_source,
+        );
+    }
+
+    /**
+     * Get an Airtime pricing quotation without debiting the wallet
+     * or contacting an Airtime provider.
+     */
+    public function quote_airtime(WP_REST_Request $request)
+    {
+        $wp_user_id = get_current_user_id();
+
+        if (!$wp_user_id) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Authenticated user could not be identified.',
+            ), 401);
+        }
+
+        $network = strtolower(trim(
+            sanitize_text_field((string) $request->get_param('network'))
+        ));
+        $type = strtolower(trim(
+            sanitize_text_field((string) $request->get_param('type'))
+        ));
+        $amount_input = $request->get_param('amount');
+
+        if ($network === '' || $type === '' || $amount_input === null) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Network, Airtime type and amount are required.',
+            ), 400);
+        }
+
+        if (
+            !is_numeric($amount_input) ||
+            !is_finite((float) $amount_input) ||
+            (float) $amount_input <= 0
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Please provide a valid Airtime amount.',
+            ), 400);
+        }
+
+        if (
+            !class_exists('Users') ||
+            !class_exists('Vtupress_Service_Container')
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Airtime services are currently unavailable.',
+            ), 503);
+        }
+
+        $users_api = new Users();
+        $vt_user = $users_api->getUser($wp_user_id, true, true);
+
+        if (
+            !$vt_user ||
+            !is_array($vt_user) ||
+            empty($vt_user['id'])
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Your VTU Press account could not be found.',
+            ), 404);
+        }
+
+        $vtu_user_id = (int) $vt_user['id'];
+
+        // Initialize the main Airtime service using the WordPress user ID,
+        // matching the existing purchase endpoint's country context.
+        $main_service = Vtupress_Service_Container::get(
+            'airtime',
+            false,
+            $wp_user_id
+        );
+
+        if (!$main_service) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Airtime service is unavailable for your account region.',
+            ), 503);
+        }
+
+        try {
+            $main_service->boot();
+            $main_settings = $main_service->get_settings();
+        } catch (Throwable $exception) {
+            error_log('PsalmoteeData Mobile API: Airtime quote main service initialization failed.');
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to initialize Airtime pricing.',
+            ), 503);
+        }
+
+        if (empty($main_service->status)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Airtime service is currently disabled.',
+            ), 403);
+        }
+
+        $supported_types = $main_settings['service_types']
+            ?? $main_service->service_types;
+        $supported_types = array_map('strtolower', (array) $supported_types);
+
+        if (!in_array($type, $supported_types, true)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Airtime type is not supported.',
+            ), 400);
+        }
+
+        $service = Vtupress_Service_Container::get(
+            'airtime',
+            $type,
+            $wp_user_id
+        );
+
+        if (!$service) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Airtime type is unavailable.',
+            ), 503);
+        }
+
+        try {
+            $service->boot();
+            $settings = $service->get_settings(false);
+        } catch (Throwable $exception) {
+            error_log('PsalmoteeData Mobile API: Airtime quote type initialization failed.');
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to initialize the selected Airtime type.',
+            ), 503);
+        }
+
+        if (isset($settings['enable']) && $settings['enable'] !== 'yes') {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Airtime type is currently disabled.',
+            ), 403);
+        }
+
+        if (
+            !method_exists($service, 'is_provider_enabled_for_type') ||
+            !in_array(
+                $network,
+                array_map('strtolower', (array) $service->providers),
+                true
+            ) ||
+            !$service->is_provider_enabled_for_type($network, $type)
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected network is unavailable for this Airtime type.',
+            ), 400);
+        }
+
+        if (!method_exists($service, 'calculate_pay_amount')) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Airtime pricing calculation is unavailable.',
+            ), 503);
+        }
+
+        // Match the payload fields used by the VTU Press Airtime purchase.
+        $pricing_payload = array(
+            'type' => $type,
+            'provider' => $network,
+            'amount' => (float) $amount_input,
+        );
+
+        try {
+            // This is the same pricing method process_transaction() invokes.
+            // It calculates pricing only; it does not debit or vend.
+            $calculation = $service->calculate_pay_amount(
+                $pricing_payload,
+                $vtu_user_id,
+                $vt_user['plan'] ?? null
+            );
+        } catch (Throwable $exception) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to calculate Airtime pricing for this request.',
+            ), 400);
+        }
+
+        if (
+            !is_array($calculation) ||
+            !isset($calculation['original'], $calculation['bonus'], $calculation['payable'])
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'VTU Press returned an invalid pricing calculation.',
+            ), 503);
+        }
+
+        $breakdown = $this->get_airtime_bonus_breakdown(
+            $service,
+            $main_settings,
+            $network,
+            $type,
+            $vtu_user_id,
+            (float) $calculation['original'],
+            $calculation
+        );
+
+        if (is_wp_error($breakdown)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => $breakdown->get_error_message(),
+            ), 503);
+        }
+
+        return $this->response(array(
+            'success' => true,
+            'message' => 'Airtime pricing calculated successfully.',
+            'pricing' => $breakdown,
         ));
     }
 
