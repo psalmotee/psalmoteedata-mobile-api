@@ -2,7 +2,7 @@
 /**
  * Plugin Name: PsalmoteeData Mobile API
  * Description: Secure mobile authentication endpoints for the PsalmoteeData app.
- * Version: 0.9.0
+ * Version: 0.10.0
  * Requires at least: 6.0
  * Requires PHP: 7.4
  * Author: Psalmotee-Tech
@@ -15,7 +15,7 @@ if (!defined('ABSPATH')) {
 
 final class PsalmoteeData_Mobile_API {
 
-    const VERSION = '0.9.0';
+    const VERSION = '0.10.0';
     const REST_NAMESPACE = 'psalmoteedata-mobile/v1';
 
     // Maximum lifetime of an authentication token.
@@ -217,6 +217,42 @@ final class PsalmoteeData_Mobile_API {
             'callback' => array($this, 'quote_airtime'),
             'permission_callback' => array($this, 'authenticate_request'),
         ));
+
+        // Purchase Airtime for the authenticated user.
+        register_rest_route(self::REST_NAMESPACE, '/airtime/purchase', array(
+            'methods' => WP_REST_Server::CREATABLE,
+            'callback' => array($this, 'purchase_airtime'),
+            'permission_callback' => array($this, 'authenticate_request'),
+        ));
+
+        // Get an Airtime pricing quotation for the authenticated user.
+        register_rest_route(self::REST_NAMESPACE, '/airtime/quote', array(
+            'methods' => WP_REST_Server::CREATABLE,
+            'callback' => array($this, 'quote_airtime'),
+            'permission_callback' => array($this, 'authenticate_request'),
+        ));
+
+        // Get available Data service types and networks.
+        register_rest_route(self::REST_NAMESPACE, '/data/catalog', array(
+            'methods' => WP_REST_Server::READABLE,
+            'callback' => array($this, 'get_data_catalog'),
+            'permission_callback' => array($this, 'authenticate_request'),
+        ));
+
+        // Get Data plans for a selected network and service type.
+        register_rest_route(self::REST_NAMESPACE, '/data/plans', array(
+            'methods' => WP_REST_Server::READABLE,
+            'callback' => array($this, 'get_data_plans'),
+            'permission_callback' => array($this, 'authenticate_request'),
+        ));
+
+        // Get a Data pricing quotation for the authenticated user.
+        register_rest_route(self::REST_NAMESPACE, '/data/quote', array(
+            'methods' => WP_REST_Server::CREATABLE,
+            'callback' => array($this, 'quote_data'),
+            'permission_callback' => array($this, 'authenticate_request'),
+        ));
+
 
         // Heartbeat.
         register_rest_route(self::REST_NAMESPACE, '/heartbeat', array(
@@ -2176,7 +2212,8 @@ final class PsalmoteeData_Mobile_API {
         $type,
         $vtu_user_id,
         $base_amount,
-        array $authoritative_calculation
+        array $authoritative_calculation,
+        $service_id = 'airtime'
     ) {
         global $wpdb;
 
@@ -2276,7 +2313,7 @@ final class PsalmoteeData_Mobile_API {
                      AND set_country = %s
                      AND bonus_type = 'tiered'",
                     strtolower($user_plan),
-                    'airtime',
+                    $service_id,
                     $type,
                     $current_country
                 )
@@ -2295,7 +2332,7 @@ final class PsalmoteeData_Mobile_API {
                          AND set_country = %s
                          AND bonus_type = 'tiered'",
                         strtolower($user_plan),
-                        'airtime',
+                        $service_id,
                         $current_country
                     )
                 );
@@ -2318,7 +2355,7 @@ final class PsalmoteeData_Mobile_API {
         // Never return a breakdown that disagrees with VTU Press's own total.
         if (abs($calculated_total - $authoritative_total) > 0.01) {
             return new WP_Error(
-                'airtime_pricing_mismatch',
+                'service_pricing_mismatch',
                 'The pricing breakdown could not be verified. Please try again.',
                 array(
                     'status' => 503,
@@ -2963,6 +3000,634 @@ final class PsalmoteeData_Mobile_API {
                 'status' => $transaction_status,
                 'wallet_balance' => $wallet_balance,
             ),
+        ));
+    }
+
+    /**
+    * Get available Data service types and networks.
+    *
+    * Reads the current Data configuration from VTU Press.
+    * Only returns enabled service types and networks.
+    */
+    public function get_data_catalog(WP_REST_Request $request)
+    {
+        $wp_user_id = get_current_user_id();
+
+        if (!$wp_user_id) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Authenticated user could not be identified.',
+            ), 401);
+        }
+
+        if (!class_exists('Vtupress_Service_Container')) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Data services are currently unavailable.',
+            ), 503);
+        }
+
+        // Initialize the main Data service for this user's country.
+        $main_service = Vtupress_Service_Container::get(
+            'data',
+            false,
+            $wp_user_id
+        );
+
+        if (!$main_service) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Data service is unavailable for your account region.',
+            ), 503);
+        }
+
+        try {
+            $main_service->boot();
+            $main_settings = $main_service->get_settings();
+        } catch (Throwable $exception) {
+            error_log(
+                'PsalmoteeData Mobile API: Data catalogue initialization failed.'
+            );
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to retrieve Data service configuration.',
+            ), 503);
+        }
+
+        if (empty($main_service->status)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Data service is currently disabled.',
+            ), 403);
+        }
+
+        // Get supported Data service types from VTU Press.
+        $supported_types = $main_settings['service_types']
+            ?? $main_service->service_types;
+
+        $supported_types = array_unique(array_filter(
+            array_map(
+                function ($type) {
+                    return strtolower(trim((string) $type));
+                },
+                (array) $supported_types
+            )
+        ));
+
+        $service_types = array();
+        $networks = array();
+
+        foreach ($supported_types as $type) {
+
+            // Initialize the selected Data service type.
+            $service = Vtupress_Service_Container::get(
+                'data',
+                $type,
+                $wp_user_id
+            );
+
+            if (!$service) {
+                continue;
+            }
+
+            try {
+                $service->boot();
+                $settings = $service->get_settings(false);
+            } catch (Throwable $exception) {
+                continue;
+            }
+
+            // Skip disabled service types.
+            if (
+                isset($settings['enable']) &&
+                $settings['enable'] !== 'yes'
+            ) {
+                continue;
+            }
+
+            $service_types[] = array(
+                'value' => $type,
+                'label' => ucwords(str_replace(
+                    array('_', '-'),
+                    ' ',
+                    $type
+                )),
+            );
+
+            // Retrieve providers configured for this service type.
+            foreach ((array) $service->providers as $provider) {
+
+                $provider = strtolower(trim((string) $provider));
+
+                if ($provider === '') {
+                    continue;
+                }
+
+                // Confirm that the provider is enabled for this type.
+                if (
+                    !method_exists($service, 'is_provider_enabled_for_type') ||
+                    !$service->is_provider_enabled_for_type($provider, $type)
+                ) {
+                    continue;
+                }
+
+                if (!isset($networks[$provider])) {
+                    $networks[$provider] = array(
+                        'value' => $provider,
+                        'label' => ucwords(str_replace(
+                            array('_', '-'),
+                            ' ',
+                            $provider
+                        )),
+                        'service_types' => array(),
+                    );
+                }
+
+                $networks[$provider]['service_types'][] = $type;
+            }
+        }
+
+        // Remove duplicate service types from network entries.
+        foreach ($networks as &$network) {
+            $network['service_types'] = array_values(
+                array_unique($network['service_types'])
+            );
+        }
+        unset($network);
+
+        return $this->response(array(
+            'success' => true,
+            'service_types' => $service_types,
+            'networks' => array_values($networks),
+        ));
+    }
+
+    /**
+    * Get Data plans for a selected network and service type.
+    *
+    * Plan information is retrieved directly from VTU Press.
+    */
+    public function get_data_plans(WP_REST_Request $request)
+    {
+        $wp_user_id = get_current_user_id();
+
+        if (!$wp_user_id) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Authenticated user could not be identified.',
+            ), 401);
+        }
+
+        $network = strtolower(trim(
+            sanitize_text_field(
+                (string) $request->get_param('network')
+            )
+        ));
+
+        $type = strtolower(trim(
+            sanitize_text_field(
+                (string) $request->get_param('type')
+            )
+        ));
+
+        if ($network === '' || $type === '') {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Network and Data service type are required.',
+            ), 400);
+        }
+
+        if (!class_exists('Vtupress_Service_Container')) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Data services are currently unavailable.',
+            ), 503);
+        }
+
+        // Initialize the main Data service.
+        $main_service = Vtupress_Service_Container::get(
+            'data',
+            false,
+            $wp_user_id
+        );
+
+        if (!$main_service) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Data service is unavailable for your account region.',
+            ), 503);
+        }
+
+        try {
+            $main_service->boot();
+            $main_settings = $main_service->get_settings();
+        } catch (Throwable $exception) {
+            error_log(
+                'PsalmoteeData Mobile API: Data plans main service initialization failed.'
+            );
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to retrieve Data service configuration.',
+            ), 503);
+        }
+
+        if (empty($main_service->status)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Data service is currently disabled.',
+            ), 403);
+        }
+
+        // Validate the requested service type.
+        $supported_types = $main_settings['service_types']
+            ?? $main_service->service_types;
+
+        $supported_types = array_map(
+            'strtolower',
+            (array) $supported_types
+        );
+
+        if (!in_array($type, $supported_types, true)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Data service type is not supported.',
+            ), 400);
+        }
+
+        // Initialize the selected Data service type.
+        $service = Vtupress_Service_Container::get(
+            'data',
+            $type,
+            $wp_user_id
+        );
+
+        if (!$service) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Data service type is unavailable.',
+            ), 503);
+        }
+
+        try {
+            $service->boot();
+            $settings = $service->get_settings(false);
+        } catch (Throwable $exception) {
+            error_log(
+                'PsalmoteeData Mobile API: Data plans type initialization failed.'
+            );
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to initialize the selected Data service type.',
+            ), 503);
+        }
+
+        // Confirm that the selected service type is enabled.
+        if (
+            isset($settings['enable']) &&
+            $settings['enable'] !== 'yes'
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Data service type is currently disabled.',
+            ), 403);
+        }
+
+        // Confirm that the selected network is configured and enabled.
+        if (
+            !method_exists($service, 'is_provider_enabled_for_type') ||
+            !in_array(
+                $network,
+                array_map('strtolower', (array) $service->providers),
+                true
+            ) ||
+            !$service->is_provider_enabled_for_type($network, $type)
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected network is unavailable for this Data type.',
+            ), 400);
+        }
+
+        if (!is_array($service->plans)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to retrieve available Data plans.',
+            ), 503);
+        }
+
+        $plans = array();
+
+        foreach ($service->plans as $plan) {
+
+            // Return only plans matching the selected network and type.
+            if (
+                strtolower((string) ($plan['network'] ?? '')) !== $network ||
+                strtolower((string) ($plan['service_type'] ?? '')) !== $type
+            ) {
+                continue;
+            }
+
+            $plan_id = (string) ($plan['id'] ?? '');
+            $plan_name = (string) ($plan['name'] ?? '');
+            $price = (float) ($plan['price'] ?? 0);
+
+            if ($plan_id === '' || $plan_name === '' || $price <= 0) {
+                continue;
+            }
+
+            $plans[] = array(
+                'id' => $plan_id,
+                'name' => $plan_name,
+                'network' => $network,
+                'service_type' => $type,
+                'price' => round($price, 2),
+            );
+        }
+
+        return $this->response(array(
+            'success' => true,
+            'network' => $network,
+            'service_type' => $type,
+            'total' => count($plans),
+            'plans' => $plans,
+        ));
+    }
+
+    /**
+    * Get a Data pricing quotation without debiting the wallet
+    * or contacting a Data provider.
+    */
+    public function quote_data(WP_REST_Request $request)
+    {
+        // Get the authenticated WordPress user.
+        $wp_user_id = get_current_user_id();
+
+        if (!$wp_user_id) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Authenticated user could not be identified.',
+            ), 401);
+        }
+
+        // Collect request parameters.
+        $network = strtolower(trim(
+            sanitize_text_field((string) $request->get_param('network'))
+        ));
+
+        $type = strtolower(trim(
+            sanitize_text_field((string) $request->get_param('type'))
+        ));
+
+        $plan_id = trim(
+            sanitize_text_field((string) $request->get_param('plan_id'))
+        );
+
+        if ($network === '' || $type === '' || $plan_id === '') {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Network, Data service type and plan ID are required.',
+            ), 400);
+        }
+
+        // Check required VTU Press services.
+        if (
+            !class_exists('Users') ||
+            !class_exists('Vtupress_Service_Container')
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Data services are currently unavailable.',
+            ), 503);
+        }
+
+        // Retrieve the authenticated user's VTU Press account.
+        $users_api = new Users();
+
+        $vt_user = $users_api->getUser(
+            $wp_user_id,
+            true,
+            true
+        );
+
+        if (
+            !$vt_user ||
+            !is_array($vt_user) ||
+            empty($vt_user['id'])
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Your VTU Press account could not be found.',
+            ), 404);
+        }
+
+        $vtu_user_id = (int) $vt_user['id'];
+
+        // Initialize the main Data service.
+        $main_service = Vtupress_Service_Container::get(
+            'data',
+            false,
+            $wp_user_id
+        );
+
+        if (!$main_service) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Data service is unavailable for your account region.',
+            ), 503);
+        }
+
+        try {
+            $main_service->boot();
+            $main_settings = $main_service->get_settings();
+        } catch (Throwable $exception) {
+            error_log(
+                'PsalmoteeData Mobile API: Data quote main service initialization failed.'
+            );
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to initialize Data pricing.',
+            ), 503);
+        }
+
+        if (empty($main_service->status)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Data service is currently disabled.',
+            ), 403);
+        }
+
+        // Validate the selected Data service type.
+        $supported_types = $main_settings['service_types']
+            ?? $main_service->service_types;
+
+        $supported_types = array_map(
+            'strtolower',
+            (array) $supported_types
+        );
+
+        if (!in_array($type, $supported_types, true)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Data service type is not supported.',
+            ), 400);
+        }
+
+        // Initialize the selected Data service type.
+        $service = Vtupress_Service_Container::get(
+            'data',
+            $type,
+            $wp_user_id
+        );
+
+        if (!$service) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Data type is unavailable.',
+            ), 503);
+        }
+
+        try {
+            $service->boot();
+            $settings = $service->get_settings(false);
+        } catch (Throwable $exception) {
+            error_log(
+                'PsalmoteeData Mobile API: Data quote type initialization failed.'
+            );
+
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to initialize the selected Data type.',
+            ), 503);
+        }
+
+        // Check whether the selected Data type is enabled.
+        if (
+            isset($settings['enable']) &&
+            $settings['enable'] !== 'yes'
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Data type is currently disabled.',
+            ), 403);
+        }
+
+        // Validate the selected network.
+        if (
+            !method_exists($service, 'is_provider_enabled_for_type') ||
+            !in_array(
+                $network,
+                array_map('strtolower', (array) $service->providers),
+                true
+            ) ||
+            !$service->is_provider_enabled_for_type($network, $type)
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected network is unavailable for this Data type.',
+            ), 400);
+        }
+
+        // Confirm that the selected plan belongs to this network and type.
+        if (!is_array($service->plans)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Data plans are currently unavailable.',
+            ), 503);
+        }
+
+        $selected_plan = null;
+
+        foreach ($service->plans as $plan) {
+            if (
+                isset($plan['id']) &&
+                (string) $plan['id'] === $plan_id &&
+                strtolower((string) ($plan['network'] ?? '')) === $network &&
+                strtolower((string) ($plan['service_type'] ?? '')) === $type
+            ) {
+                $selected_plan = $plan;
+                break;
+            }
+        }
+
+        if (!$selected_plan) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'The selected Data plan is invalid or unavailable.',
+            ), 400);
+        }
+
+        // Check that VTU Press pricing calculation is available.
+        if (!method_exists($service, 'calculate_pay_amount')) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Data pricing calculation is unavailable.',
+            ), 503);
+        }
+
+        // Use the actual VTU Press plan ID.
+        $pricing_payload = array(
+            'network' => $network,
+            'type' => $type,
+            'plan' => $plan_id,
+        );
+
+        try {
+            // Calculate the authoritative Data pricing.
+            // This does not debit the wallet or vend the Data plan.
+            $calculation = $service->calculate_pay_amount(
+                $pricing_payload,
+                $vtu_user_id,
+                $vt_user['plan'] ?? null
+            );
+        } catch (Throwable $exception) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'Unable to calculate Data pricing for this request.',
+            ), 400);
+        }
+
+        if (
+            !is_array($calculation) ||
+            !isset(
+                $calculation['original'],
+                $calculation['bonus'],
+                $calculation['payable']
+            )
+        ) {
+            return $this->response(array(
+                'success' => false,
+                'message' => 'VTU Press returned an invalid pricing calculation.',
+            ), 503);
+        }
+
+        // Build the same pricing breakdown used by Airtime.
+        // The service ID is explicitly set to data for tiered rewards.
+        $breakdown = $this->get_airtime_bonus_breakdown(
+            $service,
+            $main_settings,
+            $network,
+            $type,
+            $vtu_user_id,
+            (float) $calculation['original'],
+            $calculation,
+            'data'
+        );
+
+        if (is_wp_error($breakdown)) {
+            return $this->response(array(
+                'success' => false,
+                'message' => $breakdown->get_error_message(),
+            ), 503);
+        }
+
+        return $this->response(array(
+            'success' => true,
+            'message' => 'Data pricing calculated successfully.',
+            'pricing' => $breakdown,
         ));
     }
 
